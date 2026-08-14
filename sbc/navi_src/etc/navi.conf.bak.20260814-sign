@@ -1,0 +1,125 @@
+# navi.conf — 현장에서 바뀌는 값. navi 가 시작할 때 읽는다 (없으면 config.hpp 기본값).
+#
+# 재빌드 없이 고칠 수 있다. 값을 바꾼 뒤 navi 를 다시 띄우면 반영된다.
+#   navi 실행 경로에 두거나, NAVI_CONF=/경로/navi.conf 로 지정
+#
+# 형식:  키 = 값     (# 뒤는 주석, 빈 줄 무시)
+
+# ── 구동 모터 ────────────────────────────────────────────────────
+# ── RS485 ───────────────────────────────────────────────────────
+# 🔴 보드를 바꾸면 de_chip / de_line 이 달라진다. 반드시 실측할 것:
+#       gpiofind PIN_12
+#    ROCK 3A (RK3568)  → gpiochip3 line 3   (GPIO3_A3)
+#    ROCK 5A (RK3588S) → gpiochip4 line 1   (GPIO4_A1)
+#    칩 번호는 뱅크 번호와 같다는 보장이 없다(커널 프로브 순서를 따른다).
+rs485_port   = /dev/ttyS2   # 3A·5A 모두 40핀 8/10번 = UART2
+de_chip      = gpiochip4    # ← 5A 기준
+de_line      = 1            # ← 5A 기준
+rs485_baud   = 115200
+# 🔴 보드마다 다르다. 3A=300, 5A=200 (실측).
+#    이 값이 틀리면 RS485 만 문제가 아니다 — tick 전체가 밀려
+#    열화상이 -273℃(오류값)로 나오고 tick 이 41ms 로 늘어난다.
+#    모터가 잘 돈다고 이 값이 맞는 게 아니다.
+de_guard_us  = 200
+gear_ratio   = 20.0
+max_wheel_rpm = 150
+
+# 휠 정의:  wheel = ID, 라벨, sign
+#
+#   sign 은 좌우 장착 방향 보정이다. **전진 명령에 네 바퀴가 같은 방향으로 굴러가도록**
+#   실물을 보고 맞춘다. 보통 좌측 +1 / 우측 -1 이지만 모터를 어떻게 끼웠느냐에 달렸다.
+#
+#   맞추는 법:  sudo ./navi wheelcheck
+#              축을 하나씩 천천히 돌려준다. 전진 방향으로 굴러가면 그대로,
+#              반대로 굴러가면 그 축의 sign 을 뒤집어서 여기 저장하면 된다.
+#
+#   ⚠ 순서가 곧 FL FR RL RR 배치다. 운동학이 이 순서를 전제한다.
+#      (bodyToWheels 가 [0]=FL [1]=FR [2]=RL [3]=RR 로 계산한다)
+# 실물 장착 위치 (2026-08-07 확인). 없는 축을 적으면 한 축 실패 → 전 축 e-stop 이 걸린다.
+#   2026-08-13: 모터 4대 교체 후 ID/감속비/보레이트 재부여 — 4축 전부 응답·회전 확인.
+#   ID 는 배열 순서와 일치시켰다 (FL=1 FR=2 RL=3 RR=4).
+#   sign 은 좌우 대칭 가정값이다. wheelcheck 로 아직 확인 안 했다.
+wheel = 1, FL, +1      # 왼쪽 앞
+wheel = 2, FR, -1      # 오른쪽 앞
+wheel = 3, RL, +1      # 왼쪽 뒤
+wheel = 4, RR, -1      # 오른쪽 뒤
+
+# ── HAT 리비전 ───────────────────────────────────────────────────
+#
+# 🔴 리비전에 따라 **홀 센서 핀이 다르다.** 틀리면 액추에이터는 도는데
+#    홀 카운트만 0 이라(위치가 안 변하고 "스트로크끝단"으로 보인다) 원인을 찾기 어렵다.
+#
+#      V1  홀 핀35·31  → 5A 기준 gpiochip4:0 · gpiochip1:9  (칩이 서로 다르다)
+#      V2  홀 핀38·40  → 5A 기준 gpiochip4:5 · gpiochip4:9
+#
+#    기동 배너에 어느 리비전으로 잡혔는지 찍힌다. 보드를 바꾸면 여기부터 고칠 것.
+hat_rev = 2
+
+# ── 차체 치수 (운동학) ───────────────────────────────────────────
+# 0이면 setBodyVelocity/odometry 가 막힌다. 실측해서 채울 것.
+wheel_radius_m = 0.0
+track_width_m  = 0.0
+wheel_base_m   = 0.0
+slip_factor    = 1.0      # 스키드스티어 회전 보정. 제자리 회전 시켜보고 맞춘다
+
+# ── 주기·안전 ────────────────────────────────────────────────────
+tick_period_ms   = 20
+watchdog_ms      = 500
+# 평상시 정지 감속 시간(초). 0 이면 즉시 차단(뚝 선다).
+# e-stop·워치독은 이 값과 무관하게 항상 즉시 차단이다.
+decel_secs       = 0.8
+poll_timeout_ms  = 40     # 실측 왕복 21ms + 여유
+motor_fail_limit = 5
+
+# 🔴 과전류 보호 — 2026-08-07 모터 4대를 태우고 넣었다.
+#    전자 브레이크(무여자 작동형)를 안 풀고 돌려서 무부하인데 정격 2.7A 의 6~9배가 흘렀다.
+#    모터 내장 보호(15A 퓨즈)는 걸리지 않았다 — 믿지 말 것.
+#      지령  5 RPM →  0.2A 정상 /  10 RPM → 17.3A / 20 RPM → 25.4A 포화 후 소손
+#    중앙값이 임계를 연속 N회 넘으면 e-stop. 전류는 순간 피크라 중앙값으로 판정한다.
+overcurrent_a    = 5.0    # 카탈로그 정격 2.7A. 무부하 주행에서 이를 넘으면 이상이다
+overcurrent_hits = 3
+current_window   = 15   # 5→15 (2026-08-14): 400ms 창은 스파이크 3개만 몰려도 오트립한다
+
+# ── MQTT ─────────────────────────────────────────────────────────
+mqtt_host   = 127.0.0.1   # ← 상위 서버 주소로 교체
+mqtt_port   = 1883
+mqtt_prefix = navi
+
+# ── 프레임 전송 (초당 N장) ───────────────────────────────────────
+# 상위가 cmd/stream 으로 켠다. 아무도 안 보는데 흘리면 대역폭만 먹는다.
+#   mosquitto_pub -t navi/cmd/stream -m '{"on":true,"fps":10}'
+#
+# ⚠ 큰 이미지를 MQTT 로 밀면 브로커 큐가 밀린다.
+#   열화상(80x60 BMP 14KB)은 10fps 에 140KB/s 라 감당되지만,
+#   IR 1080p 는 그 10배가 넘는다 — IR 영상은 MediaMTX(RTSP/WebRTC)로 보낼 것.
+stream_enabled = 0     # 부팅 시 자동 시작 여부
+stream_fps     = 10
+stream_thermal = 1     # 열화상 이미지
+stream_ir      = 0     # IR 이미지 — 크다. 기본 끔
+
+# ── ToF 거리센서 ────────────────────────────────────────────────
+#
+# 🔴 HAT 리비전에 따라 연결이 다르다. 보드를 교체하면 tof_i2c 를 함께 바꿀 것.
+#      HAT V1  tof_i2c = 0   UART  40핀 7·29 (UART4_M2) → /dev/ttyS4
+#      HAT V2  tof_i2c = 1   I2C   40핀 3·5 (I2C8_M2)   → /dev/i2c-8
+#    I2C 를 쓰려면 커널 오버레이가 켜져 있어야 한다:
+#      sudo mv /boot/dtbo/rk3588-i2c8-m2.dtbo.disabled /boot/dtbo/rk3588-i2c8-m2.dtbo
+#      sudo u-boot-update && sudo reboot        확인: ls /dev/i2c-8
+tof_enabled  = 1
+tof_i2c      = 1             # ← V2. V1 로 되돌리면 0
+tof_port     = /dev/ttyS4    # UART 일 때만 쓴다
+tof_baud     = 115200
+tof_i2c_dev  = /dev/i2c-8
+tof_i2c_addr = 0x10          # TF-Luna 기본 슬레이브 주소
+tof_i2c_period_ms = 10       # 폴링 주기. 센서 갱신이 100Hz 다
+tof_min_strength = 100       # 이보다 낮으면 거리값을 못 믿는다 (데이터시트 권장)
+
+# ── 카메라 ───────────────────────────────────────────────────────
+thermal_enabled  = 1
+# 🔴 TmSDK 를 쓸지. 0 = v4l2 로 직접 읽는다 (권장).
+#    SDK Open() 이 UVC 장치를 점유하는데 정작 QueryFrame 은 블로킹된다 —
+#    실측 40회에 1회 성공(frames 1 / drops 108).
+#    v4l2 로 바꾸니 frames 107 / drops 1 / 7.8fps 로 정상이 됐다.
+#    잃는 것: FFC(셔터보정)와 SDK 컬러맵 — 흑백으로 대체한다.
+thermal_use_sdk  = 0
+thermal_colormap = 2      # 2=Jet, 4=Rainbow, 1=Bone, -1=흑백

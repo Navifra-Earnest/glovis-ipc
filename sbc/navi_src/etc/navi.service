@@ -1,0 +1,58 @@
+# navi.service — 구동체 제어 데몬
+#
+#   sudo make install
+#   sudo systemctl enable --now navi
+#   journalctl -u navi -f
+#
+# 🔴 `mqtt` 모드로 띄운다. 이 모드는 **명령을 받기 전까지 모터를 돌리지 않는다.**
+#    부팅했다고 로봇이 저절로 움직이면 안 된다 — 기본이 안전이어야 한다.
+
+[Unit]
+Description=navi — 4륜 구동체 제어 (RS485 모터 · 액추에이터 · 카메라 · MQTT)
+Documentation=file:/opt/navi/README.md
+
+# 브로커가 먼저 떠 있어야 상태를 발행할 수 있다. 다만 필수는 아니다 —
+# 브로커가 죽어도 로봇은 계속 돌아야 하므로 Requires 가 아니라 Wants 다.
+Wants=mosquitto.service network-online.target
+After=mosquitto.service network-online.target
+
+# ⚠ 재시작 제한은 [Unit] 에 둔다. [Service] 에 쓰면 systemd 가 무시한다
+#   (`Unknown key 'StartLimitIntervalSec' in section [Service]`).
+#   모터가 안 잡히면 navi 는 초기화 단계에서 죽는데, 이게 없으면
+#   5초마다 영원히 재시작하며 로그를 채운다.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/navi
+ExecStart=/opt/navi/bin/navi mqtt
+
+# sysfs(PWM·GPIO)와 시리얼을 직접 만지므로 root 가 필요하다.
+# 권한을 줄이려면 udev 규칙으로 dialout/gpio 그룹에 넘기면 되는데,
+# PWM sysfs 는 그룹 위임이 까다로워 지금은 root 로 둔다.
+User=root
+
+# 죽으면 다시 띄운다. 간격·횟수 제한은 [Unit] 의 StartLimit* 가 맡는다.
+#
+# on-failure 가 아니라 always 인 이유: 정상 종료(exit 0)로 빠져나오는 경로도
+# 운용 중에는 "멈춘 것"이라 다시 띄워야 한다. 사람이 세울 때는 systemctl stop 을 쓴다.
+Restart=always
+RestartSec=5
+
+# 종료 시 e-stop 을 거쳐 정리할 시간을 준다.
+# navi 는 SIGTERM 을 받으면 모터를 세우고 나간다 (main.cpp 의 onSignal).
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# 로그는 journald 로. 파일로 쌓으면 eMMC 쓰기가 는다.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=navi
+
+# 실시간성: tick 이 20ms 주기라 스케줄링에 밀리면 폴링이 어긋난다.
+# 다만 SCHED_FIFO 까지 갈 정도는 아니고, nice 를 낮추는 선에서 둔다.
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

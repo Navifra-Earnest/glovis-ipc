@@ -1,0 +1,51 @@
+# mediamtx.yml — 원격 조작용 저지연 영상 전송.
+#
+# 보드에서:  mediamtx /home/radxa/mediamtx.yml
+# 브라우저:  http://192.168.0.85:8889/cam      ← WebRTC, 지연 최소
+#            http://192.168.0.85:8888/cam      ← HLS (지연 크다, 참고용)
+#            rtsp://192.168.0.85:8554/cam      ← VLC 등
+#
+# 웹 UI에 심을 때는 WHEP(표준)로 붙이면 된다:
+#   http://192.168.0.85:8889/cam/whep
+# MediaMTX가 내장 페이지도 주므로 <iframe src="http://보드:8889/cam"> 로도 즉시 된다.
+
+logLevel: info
+
+# ── 저지연 설정 ──────────────────────────────────────────────────
+# 읽기 버퍼가 크면 그만큼 지연이다. 조작용이라 최소로 둔다.
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+udpMaxPayloadSize: 1472
+
+# ── 프로토콜 ─────────────────────────────────────────────────────
+rtsp: yes
+rtspAddress: :8554
+rtspTransports: [tcp, udp]
+
+webrtc: yes
+webrtcAddress: :8889
+# 같은 LAN이라 STUN/TURN이 필요 없다. 인터넷 경유로 바뀌면 그때 ICE 서버를 넣는다.
+webrtcICEServers2: []
+# 브라우저가 보드 IP로 바로 붙게 한다 (호스트 후보만으로 연결됨)
+webrtcLocalUDPAddress: :8189
+
+hls: yes
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsPartDuration: 200ms
+hlsSegmentDuration: 1s
+
+rtmp: no
+srt: no
+
+# ── 경로 ─────────────────────────────────────────────────────────
+paths:
+  cam:
+    # MediaMTX가 뜨면 카메라 인코딩도 같이 띄운다.
+    runOnInit: sh /home/radxa/cam_stream.sh See3CAM 1280 720 30 2000000 cam
+    # 🔴 runOnInitRestart: yes 는 쓰지 말 것 — 백오프가 없어 실패하는 파이프라인을
+    #    5초마다 무한 재시작한다. 그때마다 VPU(MPP) 인코더를 열고 닫는데,
+    #    2026-07-31 이걸로 보드가 하드 행에 빠져 재부팅됐다 (커널 로그도 못 남김).
+    #    재시작이 필요하면 cam_stream.sh 안에서 횟수를 제한해 감싼다.
+    runOnInitRestart: no
