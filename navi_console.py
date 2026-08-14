@@ -49,6 +49,70 @@ def fmt_state(d):
     return drive, sensor, " / ".join(warn)
 
 
+# 열화상 가짜색 팔레트. 센서는 Y16 흑백이고 색은 원래 소프트웨어가 입히는 것이다.
+# navi 는 컬러맵을 TmSDK 경로에서만 입히는데 그 SDK 가 고장나 use_sdk=0 이라
+# 흑백 BMP 가 온다(thermal.hpp:244) → IPC 에서 입힌다. navi.conf 의 thermal_colormap 은 죽은 설정.
+# ⚠️ navi 는 매 프레임 lo~hi 로 자동 정규화한다(오토게인). 그래서 전 구간에 색을 쓰는
+# 팔레트(ironbow·fire·jet)는 상온 장면도 화염처럼 그린다 — 실측으로 확인했다.
+# redhot 은 장면을 흑백으로 두고 상단 구간에만 색을 써서 그 오독을 피한다(소방 TIC 방식).
+PALETTES = {
+    "redhot":  [(0.00, 15, 15, 15), (0.55, 150, 150, 150), (0.70, 210, 205, 190),
+                (0.78, 235, 120, 40), (0.88, 255, 40, 20), (1.00, 255, 240, 120)],
+    "fire":    [(0.00, 0, 0, 0), (0.25, 120, 0, 0), (0.50, 220, 40, 0), (0.72, 255, 140, 0),
+                (0.88, 255, 220, 60), (1.00, 255, 255, 255)],
+    "ironbow": [(0.00, 0, 0, 0), (0.15, 20, 0, 80), (0.30, 100, 0, 130), (0.45, 190, 30, 90),
+                (0.60, 240, 90, 20), (0.80, 255, 180, 0), (1.00, 255, 255, 255)],
+    "jet":     [(0.00, 0, 0, 131), (0.125, 0, 0, 255), (0.375, 0, 255, 255),
+                (0.625, 255, 255, 0), (0.875, 255, 0, 0), (1.00, 128, 0, 0)],
+    "grey":    [(0.00, 0, 0, 0), (1.00, 255, 255, 255)],
+}
+
+
+def build_lut(stops):
+    """제어점 사이를 선형보간해 256단계 R/G/B 변환표 3개를 만든다."""
+    out = [bytearray(256) for _ in range(3)]
+    for i in range(256):
+        t = i / 255.0
+        lo = max([s for s in stops if s[0] <= t], key=lambda s: s[0])
+        hi = min([s for s in stops if s[0] >= t], key=lambda s: s[0])
+        f = 0.0 if hi[0] == lo[0] else (t - lo[0]) / (hi[0] - lo[0])
+        for c in range(3):
+            out[c][i] = round(lo[c + 1] + (hi[c + 1] - lo[c + 1]) * f)
+    return [bytes(b) for b in out]
+
+
+def abs_lut(lo_c, hi_c, hot_c, band_c=80.0, grey_lo=30, grey_hi=225):
+    """절대 온도 기준 LUT — hot_c ℃ 미만은 회색, 이상만 색.
+
+    navi 는 프레임마다 lo~hi 로 정규화해 흑백 BMP 를 보낸다(thermal.hpp:246):
+        g = (raw - lo) / (hi - lo) * 255
+    lo·hi 는 ℃ 로 state.thermal 에 같이 실려 오므로 역변환이 된다:
+        T(g) = lo_c + (hi_c - lo_c) * g / 255
+    덕분에 "상대적으로 제일 뜨거운 곳"이 아니라 "진짜 60℃ 넘는 곳"만 칠할 수 있다.
+    화면에 hot_c 를 넘는 게 없으면 전체가 회색으로 남는다 — 사람은 안 빨개진다.
+    """
+    span = (hi_c - lo_c) if hi_c > lo_c else 1.0
+    hot = [(0.0, 255, 120, 0), (0.45, 255, 30, 10), (1.0, 255, 245, 150)]  # 주황→빨강→백열
+    hot_luts = build_lut(hot)
+    # 회색은 lo ~ min(hot, hi) 구간에 꽉 펼친다. 양쪽 실패를 다 피하려면 이 상한이어야 한다:
+    #   lo~hi 로 깔면  → 불이 들어온 순간 상온부가 몇 단계에 갇혀 새카매진다
+    #   lo~hot 로 깔면 → 불이 없을 때 상온 2℃ 폭이 램프의 6%만 써서 역시 새카매진다
+    cool_hi = min(hot_c, hi_c)
+    cool = (cool_hi - lo_c) if cool_hi > lo_c else 1.0
+    out = [bytearray(256) for _ in range(3)]
+    for i in range(256):
+        t_c = lo_c + span * i / 255.0
+        if t_c < hot_c:
+            f = min(1.0, max(0.0, (t_c - lo_c) / cool))
+            v = grey_lo + round((grey_hi - grey_lo) * f)
+            out[0][i] = out[1][i] = out[2][i] = v
+        else:
+            k = min(255, round((t_c - hot_c) / band_c * 255))
+            for c in range(3):
+                out[c][i] = hot_luts[c][k]
+    return [bytes(b) for b in out]
+
+
 def thermal_stalled(th, seen, now, hold=8.0):
     """열화상이 멈췄나 — frames 가 hold 초 동안 안 늘면 정지로 본다. seen 은 호출자가 들고 있는 dict.
 
@@ -87,6 +151,32 @@ def selftest():
 
     assert fmt_state({})[0] == "구동 X · 0축 · 축 없음"      # 빈 state 로도 안 죽는다
 
+    for name, stops in PALETTES.items():
+        r, g, b = build_lut(stops)
+        assert len(r) == len(g) == len(b) == 256, name
+        assert (r[0], g[0], b[0]) == tuple(stops[0][1:]), name       # 양 끝이 제어점과 일치
+        assert (r[255], g[255], b[255]) == tuple(stops[-1][1:]), name
+    r, g, b = build_lut(PALETTES["grey"])
+    assert all(r[i] == g[i] == b[i] == i for i in range(256))        # grey 는 항등변환
+    assert build_lut(PALETTES["ironbow"])[0][128] > 0                # 중간이 검정이 아니다
+
+    # 절대 온도 기준 — 상온 장면(29~31℃)엔 색이 하나도 없어야 한다
+    r, g, b = abs_lut(29.0, 31.0, hot_c=60.0)
+    assert all(r[i] == g[i] == b[i] for i in range(256)), "상온인데 색이 칠해졌다"
+    # 불이 없으면 회색 램프를 꽉 써야 한다 — 안 그러면 화면이 통째로 어두워진다
+    assert r[0] < 40 and r[255] > 210, ("상온 대비가 죽었다", r[0], r[255])
+
+    # 불이 있는 장면(20~300℃): 60℃ 경계 아래는 회색, 위는 색
+    r, g, b = abs_lut(20.0, 300.0, hot_c=60.0)
+    cut = round((60.0 - 20.0) / (300.0 - 20.0) * 255)     # 60℃ 에 해당하는 픽셀값
+    assert r[cut - 3] == g[cut - 3] == b[cut - 3], "경계 아래가 회색이 아니다"
+    assert r[cut + 3] > g[cut + 3], "경계 위가 붉지 않다"
+    assert r[255] > 200 and g[255] > 200, "최상단이 백열이 아니다"
+
+    # hot_c 가 hi 보다 높으면 전부 회색 (불이 없으면 아무 색도 없다)
+    r, g, b = abs_lut(20.0, 55.0, hot_c=60.0)
+    assert all(r[i] == g[i] == b[i] for i in range(256))
+
     seen = {}
     ok = {"present": True, "frames": 100}
     assert not thermal_stalled(ok, seen, 0)                       # 첫 관측 — 판단 보류
@@ -113,6 +203,14 @@ def main():
                          "화면이 작을 때 영상을 다 가린다")
     ap.add_argument("--font-pt", type=int, default=11,
                     help="하단 바 글자 크기 pt (기본 11). 바 전체 높이가 이 값에 딸려 간다")
+    ap.add_argument("--hot-c", type=float, default=60.0,
+                    help="이 온도(℃) 이상만 색으로 칠한다. 미만은 회색 — 사람(30℃대)은 안 빨개진다. "
+                         "0 이면 절대기준을 끄고 --palette 를 그대로 쓴다")
+    ap.add_argument("--hot-band", type=float, default=80.0,
+                    help="hot-c 부터 몇 ℃ 폭으로 색을 펼칠지 (기본 80 → hot-c+80℃ 에서 백열)")
+    ap.add_argument("--palette", default="redhot", choices=sorted(PALETTES),
+                    help="열화상 가짜색 팔레트 (기본 redhot — 장면은 흑백, 뜨거운 곳만 색). "
+                         "로봇은 흑백만 보내온다")
     ap.add_argument("--logo-pct", type=float, default=4.5,
                     help="좌상단 로고 높이를 화면 높이의 %%로 (기본 4.5). 0 이면 안 띄운다")
     ap.add_argument("--logo-dir", default=None,
@@ -238,6 +336,22 @@ def main():
     pip_h = max(60, round(scr.get_height() * a.pip_pct / 100))   # 화면 비례. 1024x768 → 123px
     lbl_warn.set_name("warn")
 
+    lut = list(build_lut(PALETTES[a.palette]))   # 절대기준이 켜지면 통째로 교체된다
+    lut_key = {}                    # 절대기준 LUT 재계산용 (lo,hi 가 바뀔 때만)
+
+    def colorize(pb):
+        """흑백 픽스버프에 팔레트를 입힌다. 회색이라 R 채널만 읽어 3채널로 펼친다."""
+        w, h, rs = pb.get_width(), pb.get_height(), pb.get_rowstride()
+        if pb.get_n_channels() != 3 or rs != w * 3:   # 예상 밖 포맷이면 원본 그대로
+            return pb
+        src = pb.get_pixels()
+        g = src[0::3]
+        out = bytearray(len(src))
+        out[0::3], out[1::3], out[2::3] = (g.translate(lut[0]), g.translate(lut[1]),
+                                           g.translate(lut[2]))
+        return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(out)),
+                                               GdkPixbuf.Colorspace.RGB, False, 8, w, h, rs)
+
     cli = mqtt.Client()                              # paho 1.6.1 = v1 콜백 API
 
     def send(topic, payload="{}"):
@@ -300,6 +414,7 @@ def main():
                 ld.write(msg.payload)
                 ld.close()
                 pb = ld.get_pixbuf()
+                pb = colorize(pb)            # 흑백 → 가짜색. 확대 전에 입혀야 rowstride 가 단순하다
                 h = pip_h
                 pb = pb.scale_simple(round(h * pb.get_width() / pb.get_height()), h,
                                      GdkPixbuf.InterpType.BILINEAR)
@@ -318,6 +433,13 @@ def main():
                           drive + (f"   │   알람 {act}" if act else "   │   알람 없음"))
             GLib.idle_add(lbl_sensor.set_text,
                           sensor + (f"   │   {notice['txt']}" if notice["txt"] else ""))
+            th = d.get("thermal") or {}
+            if a.hot_c > 0 and th.get("valid"):
+                # lo·hi 가 바뀔 때만 LUT 을 다시 만든다. 프레임마다 하면 낭비다.
+                key = (round(th.get("lo", 0), 1), round(th.get("hi", 0), 1))
+                if key != lut_key.get("k") and key[1] > key[0]:
+                    lut_key["k"] = key
+                    lut[:] = abs_lut(key[0], key[1], a.hot_c, a.hot_band)
             if thermal_stalled(d.get("thermal") or {}, th_seen, time.monotonic()):
                 warn = (warn + " / " if warn else "") + \
                     "열화상 정지 — frames 고정(로봇에서 systemctl restart navi 필요)"
