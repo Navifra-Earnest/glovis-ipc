@@ -1,0 +1,14 @@
+[Unit]
+Description=Glovis Crevis IO 물리버튼 (리프트 UP/DOWN·리셋 -> navi/cmd/actuator, cmd/reset)
+After=default.target
+
+[Service]
+# 조이스틱·콘솔과 별도 프로세스다 — Modbus 가 멈춰도 주행이 죽지 않아야 한다.
+# Restart=always 가 안전장치다: 이 프로세스가 죽으면 액추에이터를 세울 주체가 없다
+# (주행 중에는 워치독이 대신 세워주지 않는다 — crevis_io.py 의 STOP 주석 참고).
+ExecStart=/usr/bin/python3 -u %h/glovis/crevis_io.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

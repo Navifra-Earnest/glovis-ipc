@@ -1,0 +1,18 @@
+[Unit]
+Description=Glovis 화재진압로봇 IPC 콘솔 (영상 + 상태 + e-stop)
+# 데스크탑 세션이 뜬 뒤에 시작해야 창을 띄울 수 있다
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+# GDK_BACKEND=wayland 를 명시한다 — DISPLAY 가 남아 있으면 GTK 가 X11 을 먼저 잡고
+# "Authorization required" 로 창을 못 연다(원격 세션엔 Xauthority 쿠키가 없다).
+Environment=GDK_BACKEND=wayland
+Environment=WAYLAND_DISPLAY=wayland-0
+UnsetEnvironment=DISPLAY
+ExecStart=/usr/bin/python3 -u %h/glovis/navi_console.py --fullscreen
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
