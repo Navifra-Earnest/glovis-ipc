@@ -1,10 +1,10 @@
 #!/bin/bash
-# IPC 세팅 — 이 저장소를 IPC 의 ~/glovis 로 클론한 뒤 여기서 실행한다.
+# IPC 세팅 — 이 저장소를 IPC 의 ~/navifra 로 클론한 뒤 여기서 실행한다.
 #
 #   ssh navifra@<IPC>
-#   git clone <이 저장소> ~/glovis && ~/glovis/install.sh
+#   git clone <이 저장소> ~/navifra && ~/navifra/install.sh
 #
-# 갱신은 `git pull && ~/glovis/install.sh` 또는 코드만 바뀐 경우
+# 갱신은 `git pull && ~/navifra/install.sh` 또는 코드만 바뀐 경우
 # `systemctl --user restart joy-teleop crevis-io navi-console`.
 #
 # 멱등하다 — 몇 번 돌려도 같은 결과다.
@@ -12,9 +12,9 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 HERE=$(pwd)
 
-# 서비스 유닛이 %h/glovis/*.py 를 가리킨다 → 경로가 고정이어야 한다.
-if [ "$HERE" != "$HOME/glovis" ]; then
-    echo "❌ 이 저장소는 ~/glovis 에 있어야 한다 (유닛의 ExecStart 가 %h/glovis 고정)."
+# 서비스 유닛이 %h/navifra/*.py 를 가리킨다 → 경로가 고정이어야 한다.
+if [ "$HERE" != "$HOME/navifra" ]; then
+    echo "❌ 이 저장소는 ~/navifra 에 있어야 한다 (유닛의 ExecStart 가 %h/navifra 고정)."
     echo "   현재: $HERE"
     exit 1
 fi

@@ -10,7 +10,7 @@ PartOf=graphical-session.target
 Environment=GDK_BACKEND=wayland
 Environment=WAYLAND_DISPLAY=wayland-0
 UnsetEnvironment=DISPLAY
-ExecStart=/usr/bin/python3 -u %h/glovis/navi_console.py --fullscreen
+ExecStart=/usr/bin/python3 -u %h/navifra/navi_console.py --fullscreen
 Restart=always
 RestartSec=3
 

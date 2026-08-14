@@ -23,19 +23,19 @@ GUI 렌더링이 구동 명령의 350 ms 케이던스를 막으면 로봇이 워
 
 ## 설치
 
-저장소가 진짜(truth)이고 IPC 는 배포본이다. **유닛이 `%h/glovis/*.py` 를 직접 가리키므로
-경로는 `~/glovis` 고정**이다 — 사본을 만들지 않는다.
+저장소가 진짜(truth)이고 IPC 는 배포본이다. **유닛이 `%h/navifra/*.py` 를 직접 가리키므로
+경로는 `~/navifra` 고정**이다 — 사본을 만들지 않는다.
 
 ```bash
 ssh navifra@<IPC>
-git clone <이 저장소> ~/glovis
-~/glovis/install.sh
+git clone <이 저장소> ~/navifra
+~/navifra/install.sh
 ```
 
 갱신:
 
 ```bash
-cd ~/glovis && git pull && ./install.sh        # 유닛까지 바뀐 경우
+cd ~/navifra && git pull && ./install.sh        # 유닛까지 바뀐 경우
 systemctl --user restart joy-teleop crevis-io  # 코드만 바뀐 경우
 ```
 

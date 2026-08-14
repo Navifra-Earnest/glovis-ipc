@@ -5,7 +5,7 @@ After=default.target
 [Service]
 # 콘솔(navi-console)과 별도 프로세스다 — 구동 명령의 350ms 케이던스가
 # GUI 렌더링에 막히면 워치독이 로봇을 세운다.
-ExecStart=/usr/bin/python3 -u %h/glovis/joy_teleop.py
+ExecStart=/usr/bin/python3 -u %h/navifra/joy_teleop.py
 Restart=always
 RestartSec=3
 
