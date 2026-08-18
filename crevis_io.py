@@ -18,7 +18,6 @@ Modbus 가 멈춰도 주행이 죽지 않아야 한다.
 """
 import argparse
 import json
-import pathlib
 import subprocess
 import sys
 import time
@@ -48,6 +47,13 @@ STOP = json.dumps({"dir": "ext", "duty": 0})
 #    안 적혀 있고, 처음에 ext=상승으로 넣었다가 실기에서 반대로 움직였다.
 #    또 뒤집힐 일이 생기면 **이 한 줄만** 고친다.
 WIRE = {"up": "ret", "down": "ext"}
+
+# 리셋 버튼이 실행할 명령. 🔴 `{host}` 를 **반드시** 남긴다 — 여기에 IP 를 박았더니
+# 무선으로 돌던 2026-08-18 에 리셋이 조용히 전부 실패했다(핸드오프 4.14).
+# 무선 IP 는 known_hosts 에 없을 수 있어 accept-new 로 붙는다.
+RESTART_CMD = ("ssh -o BatchMode=yes -o ConnectTimeout=5 "
+               "-o StrictHostKeyChecking=accept-new "
+               "radxa@{host} sudo -n systemctl restart navi")
 
 # duty 를 안 넣으면 보드의 navi.conf 설정값(actuator_duty)을 쓴다 — IPC 에 값을 중복하지 않는다.
 JOG = {k: json.dumps({"dir": v}) for k, v in WIRE.items()}
@@ -98,10 +104,7 @@ def main():
     ap.add_argument("--prefix", default="navi")
     ap.add_argument("--period", type=float, default=0.35,
                     help="조그 반복 발행 주기 s (워치독 500ms 미만)")
-    ap.add_argument("--restart-cmd",
-                    default="ssh -o BatchMode=yes -o ConnectTimeout=5 "
-                            "-o StrictHostKeyChecking=accept-new "
-                            "radxa@{host} sudo -n systemctl restart navi",
+    ap.add_argument("--restart-cmd", default=RESTART_CMD,
                     help="리셋 버튼이 실행할 명령. `{host}` 는 **현재 붙어 있는 경로**로 치환된다"
                          " (유선/무선). 키 인증 + sudoers NOPASSWD 가 전제")
     ap.add_argument("--restart-cooldown", type=float, default=15.0,
@@ -114,6 +117,10 @@ def main():
 
     if a.selftest:
         return selftest()
+
+    # `"radxa@10.10.10.64".format(host=x)` 는 **조용히 원문을 돌려준다** — 치환자를 빼먹으면
+    # 경로가 박힌 채로 잘 도는 것처럼 보인다. selftest 는 기본값만 보므로 런타임에서도 막는다.
+    assert "{host}" in a.restart_cmd, "--restart-cmd 에 {host} 치환자가 없다 — 경로가 박힌다"
 
     st = {"estop": False}
 
@@ -225,9 +232,8 @@ def selftest():
     assert json.loads(STOP)["duty"] == 0
 
     # 리셋 명령에 IP 를 박으면 다른 경로에서 조용히 전부 실패한다(2026-08-18). 재발 방지.
-    src = pathlib.Path(__file__).read_text().split("def selftest")[0]
-    assert "radxa@{host}" in src, "restart-cmd 기본값에 {host} 치환자가 없다"
-    assert "10.10.10." not in src, "리셋 명령에 IP 가 박혀 있다"
+    assert "{host}" in RESTART_CMD, "리셋 명령에 {host} 치환자가 없다 — 경로가 박힌다"
+    assert RESTART_CMD.format(host="1.2.3.4").endswith("systemctl restart navi")
 
     d = Debounce(2)
     assert d.update(True) is False          # 1샘플 — 아직 확정 아님

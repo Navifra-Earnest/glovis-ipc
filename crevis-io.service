@@ -1,5 +1,5 @@
 [Unit]
-Description=Glovis Crevis IO 물리버튼 (리프트 UP/DOWN·리셋 -> navi/cmd/actuator, cmd/reset)
+Description=Glovis Crevis IO 물리버튼 (리프트 UP/DOWN·리셋 -> navi/cmd/actuator, systemctl restart navi)
 After=default.target
 
 [Service]
