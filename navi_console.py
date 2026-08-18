@@ -12,7 +12,9 @@ GTK3 + GStreamer(gtksink) + paho-mqtt. 전부 IPC 에 이미 있는 것만 쓴�
 """
 import argparse, json, os, sys, time
 
-HOST, PORT, PREFIX = "10.10.10.64", 1883, "navi"
+import mqtt_link
+
+PORT, PREFIX = 1883, "navi"
 VIDEO_PORT = 5000
 RECONNECT_S = 2          # 영상 파이프라인 오류 후 재시도 간격
 
@@ -190,7 +192,8 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default=HOST)
+    ap.add_argument("--hosts", default=",".join(mqtt_link.HOSTS),
+                    help="브로커 후보. 쉼표 구분이고 **앞이 우선순위**다 (유선 → 무선)")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--prefix", default=PREFIX)
     ap.add_argument("--fullscreen", action="store_true")
@@ -228,19 +231,23 @@ def main():
     gi.require_version("Gtk", "3.0")
     gi.require_version("Gst", "1.0")
     from gi.repository import Gtk, Gst, GLib, Gdk, Pango, GdkPixbuf
-    import paho.mqtt.client as mqtt
 
     Gst.init(None)
 
     # ---------- 영상 ----------
+    # 영상도 MQTT 와 같은 경로를 타야 한다. 시작 시점엔 아직 Link 가 없으므로 직접 고른다
+    # (여기서 잠깐 블로킹해도 GUI 루프 시작 전이라 무해하다).
+    hosts = a.hosts.split(",")
+    vhost = mqtt_link.pick(hosts, a.port) or hosts[0]
+
     if Gst.ElementFactory.find("gtksink") is None:
         sys.exit("gtksink 가 없다: sudo apt install gstreamer1.0-gtk3")
     # 카메라가 뒤집혀 장착돼 있어 기본 180도 회전. 장착이 바뀌면 --rotate 로 조정한다.
     flip = "" if a.rotate == "none" else f"videoflip method={a.rotate} ! "
     pipe = Gst.parse_launch(                         # sync=false → 지연 누적 대신 최신 프레임 우선
-        f"tcpclientsrc host={a.host} port={VIDEO_PORT} ! "
+        f"tcpclientsrc name=vsrc host={vhost} port={VIDEO_PORT} ! "
         f"h264parse ! avdec_h264 ! {flip}videoconvert ! gtksink name=vsink sync=false")
-    sink = pipe.get_by_name("vsink")
+    sink, vsrc = pipe.get_by_name("vsink"), pipe.get_by_name("vsrc")
 
     def restart_video():
         pipe.set_state(Gst.State.NULL)
@@ -308,10 +315,11 @@ def main():
     stat.set_hexpand(True)
     bar.pack_start(stat, True, True, 0)
 
+    lbl_link = Gtk.Label(xalign=0)
     lbl_drive = Gtk.Label(xalign=0)
     lbl_sensor = Gtk.Label(xalign=0)
     lbl_warn = Gtk.Label(xalign=0)
-    for l in (lbl_drive, lbl_sensor, lbl_warn):
+    for l in (lbl_link, lbl_drive, lbl_sensor, lbl_warn):
         l.set_line_wrap(True)                        # 자르지 않고 접는다
         l.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
         l.set_xalign(0)
@@ -352,7 +360,6 @@ def main():
         return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(out)),
                                                GdkPixbuf.Colorspace.RGB, False, 8, w, h, rs)
 
-    cli = mqtt.Client()                              # paho 1.6.1 = v1 콜백 API
 
     def send(topic, payload="{}"):
         cli.publish(f"{a.prefix}/{topic}", payload, qos=1)
@@ -400,7 +407,7 @@ def main():
         c.publish(a.enable_topic, '{"on":false}', qos=1, retain=True)
         GLib.idle_add(tgl.set_active, False)
         notice["txt"] = ""
-        GLib.idle_add(lbl_drive.set_text, f"MQTT {a.host}:{a.port} 연결 (rc={rc}) — 상태 수신 대기")
+        GLib.idle_add(lbl_drive.set_text, f"MQTT 연결 (rc={rc}) — 상태 수신 대기")
 
     def on_disconnect(_c, _u, rc):
         notice["txt"] = f"⚠ MQTT 끊김(rc={rc}) 재접속 중"
@@ -460,11 +467,32 @@ def main():
         elif sub == "event":
             notice["txt"] = f"event {d.get('event')} {d.get('detail', '')}".strip()[:100]
 
-    cli.on_connect, cli.on_message, cli.on_disconnect = on_connect, on_message, on_disconnect
-    # 콘솔이 죽으면 브로커가 대신 잠금을 발행한다 — 조종 화면 없이 구동되는 상태를 막는다
-    cli.will_set(a.enable_topic, '{"on":false}', qos=1, retain=True)
-    cli.connect_async(a.host, a.port, 30)
-    cli.loop_start()
+    def on_switch(old, new):
+        # 경로가 바뀌면 영상도 따라가야 한다 — 기존 재접속 경로를 그대로 쓴다
+        vsrc.set_property("host", new)
+        GLib.idle_add(restart_video)
+
+    # 유선 우선 · 무선 폴백 (mqtt_link 참고). 콘솔이 죽으면 브로커가 대신 잠금을 발행한다
+    # — 조종 화면 없이 구동되는 상태를 막는다.
+    cli = mqtt_link.Link(hosts=hosts, port=a.port,
+                         on_connect=on_connect, on_message=on_message,
+                         on_disconnect=on_disconnect, on_switch=on_switch,
+                         will=(a.enable_topic, '{"on":false}', 1, True),
+                         log=lambda m: print(m, flush=True))
+
+    def link_tick():
+        cli.tick()
+        if not cli.connected:
+            lbl_link.set_text("⚠ 링크 없음 — 재접속 중")
+        elif cli.host == hosts[0]:
+            lbl_link.set_text(f"🔗 유선 {cli.host}")
+        else:
+            w = mqtt_link.wifi_signal()
+            sig = f"  {w[2]:.0f} dBm ({w[1]}%)" if w else ""
+            lbl_link.set_text(f"📶 무선 {cli.host}{sig}")
+        return True
+    link_tick()
+    GLib.timeout_add(1500, link_tick)
 
     # ---------- 조작 ----------
     def on_key(_w, ev):

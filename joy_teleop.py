@@ -9,13 +9,13 @@ IPC 에서 실행한다. cmd/body 는 쓰지 않는다 — kinematics:false 면 
 애초에 vy(측면 이동)를 표현할 수 없다. 메카넘 역기구학을 IPC 에서 풀어
 축별 RPM 을 cmd/wheel 로 보낸다.
 
-  python3 joy_teleop.py                       # 유선 직결(10.10.10.64)
-  python3 joy_teleop.py --host 192.168.50.1   # AP 폴백
+  python3 joy_teleop.py                       # 유선 우선, 끊기면 무선(AP) 자동 폴백
+  python3 joy_teleop.py --hosts 192.168.50.1  # 무선만 강제(유선 배제)
   python3 joy_teleop.py --prefix navitest     # 로봇 안 움직이는 발행 확인용
   python3 joy_teleop.py --selftest           # 기구학 자체검증 (하드웨어 불필요)
 """
 import argparse, glob, json, math, os, struct, sys, time
-import paho.mqtt.client as mqtt
+import mqtt_link
 
 WHEEL_RADIUS_M = 0.076   # 실측 후 수정. 속도 스케일에만 영향 — 틀려도 방향은 안 바뀐다
 MAX_RPM        = 20.0    # 축별 안전 상한 (문서 예제 최대치)
@@ -121,7 +121,8 @@ class Hat:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="10.10.10.64")   # 유선 직결. AP 폴백은 192.168.50.1
+    ap.add_argument("--hosts", default=",".join(mqtt_link.HOSTS),
+                    help="브로커 후보. 쉼표 구분이고 **앞이 우선순위**다 (유선 → 무선)")
     ap.add_argument("--port", type=int, default=1883)
     ap.add_argument("--prefix", default="navi")
     ap.add_argument("--js", default=None)
@@ -144,13 +145,12 @@ def main():
         return selftest()
 
     hat = Hat(a.js or find_joystick(), a.spin_button)
-    cli = mqtt.Client()                     # paho 1.6.1 = v1 콜백 API
     st = {}
 
     def on_connect(c, u, flags, rc):
         c.subscribe([(a.prefix + "/state", 0), (a.prefix + "/event", 1),
                      (a.enable_topic, 1)])
-        print(f"[mqtt] {a.host}:{a.port} rc={rc}  구동잠김(콘솔에서 허용해야 움직인다)")
+        print(f"[mqtt] rc={rc}  구동잠김(콘솔에서 허용해야 움직인다)")
 
     def on_message(c, u, msg):
         try:
@@ -175,14 +175,15 @@ def main():
             if cur[2]:
                 print("        ⚠ e-stop 래치 — cmd/reset 만 해제된다")
 
-    cli.on_connect, cli.on_message = on_connect, on_message
-    cli.connect(a.host, a.port, 30)
-    cli.loop_start()
+    # 유선 우선 · 무선 폴백. tick() 이 재접속과 승격을 맡는다 (mqtt_link 참고)
+    cli = mqtt_link.Link(hosts=a.hosts.split(","), port=a.port,
+                         on_connect=on_connect, on_message=on_message)
 
     moving, last_rpm, last_pub, locked = False, None, 0.0, False
     try:
         while True:
             hat.poll()
+            cli.tick()
             # hat: 위=-1, 좌=-1 / ROS: +y=좌, +wz=CCW(좌회전).
             # vx 부호는 2026-08-14 실기에서 뒤집었다 — 전진 지령에 로봇이 뒤로 갔다.
             # 좌우(vy)는 건드리지 않는다. SBC 의 wheel sign 을 뒤집으면 좌우까지 같이 뒤집힌다.
@@ -219,7 +220,7 @@ def main():
         # 어차피 명령이 끊기면 워치독이 500ms 에 세운다 — 짧게 흘려보내고 나간다.
         cli.publish(a.prefix + "/cmd/stop", "{}", qos=1)
         time.sleep(0.2)
-        cli.loop_stop()
+        cli.stop()
         print("\n정지 명령 발행 후 종료")
 
 

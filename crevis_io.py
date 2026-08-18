@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 
-import paho.mqtt.client as mqtt
+import mqtt_link
 
 from crevis_probe import Modbus
 
@@ -91,7 +91,8 @@ def main():
     ap.add_argument("--io-host", default="192.168.100.100")
     ap.add_argument("--io-port", type=int, default=502)
     ap.add_argument("--unit", type=int, default=1)
-    ap.add_argument("--host", default="10.10.10.64", help="MQTT 브로커 = 로봇")
+    ap.add_argument("--hosts", default=",".join(mqtt_link.HOSTS),
+                    help="브로커 후보. 쉼표 구분이고 **앞이 우선순위**다 (유선 → 무선)")
     ap.add_argument("--port", type=int, default=1883)
     ap.add_argument("--prefix", default="navi")
     ap.add_argument("--period", type=float, default=0.35,
@@ -111,12 +112,11 @@ def main():
     if a.selftest:
         return selftest()
 
-    cli = mqtt.Client()                      # paho 1.6.1 = v1 콜백 API
     st = {"estop": False}
 
     def on_connect(c, u, flags, rc):
         c.subscribe(a.prefix + "/state", 0)
-        print(f"[mqtt] {a.host}:{a.port} rc={rc}", flush=True)
+        print(f"[mqtt] rc={rc}", flush=True)
 
     def on_message(c, u, msg):
         try:
@@ -128,9 +128,9 @@ def main():
             print(f"\n[estop] {'래치 — 리셋 버튼으로 해제' if st['estop'] else '해제됨'}",
                   flush=True)
 
-    cli.on_connect, cli.on_message = on_connect, on_message
-    cli.connect(a.host, a.port, 30)
-    cli.loop_start()
+    # 유선 우선 · 무선 폴백 (mqtt_link 참고)
+    cli = mqtt_link.Link(hosts=a.hosts.split(","), port=a.port,
+                         on_connect=on_connect, on_message=on_message)
 
     def stop_actuator(why):
         cli.publish(a.prefix + "/cmd/actuator", STOP, qos=1)
@@ -188,6 +188,7 @@ def main():
                     subprocess.Popen(a.restart_cmd, shell=True)
                     print(f"\n[리셋] navi 재시작 요청: {a.restart_cmd}", flush=True)
 
+            cli.tick()
             time.sleep(POLL)
     except KeyboardInterrupt:
         pass
@@ -196,7 +197,7 @@ def main():
         #    주행 중이면 워치독이 대신 세워주지 않는다(위 STOP 주석 참고).
         cli.publish(a.prefix + "/cmd/actuator", STOP, qos=1)
         time.sleep(0.2)
-        cli.loop_stop()
+        cli.stop()
         print("\n액추에이터 정지 발행 후 종료")
 
 
