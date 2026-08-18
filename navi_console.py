@@ -290,14 +290,21 @@ def main():
             # 위 블로킹을 계속 유발한다. navi 가 돌아오면 그때 붙는다.
             # 로그는 **전환 시점만** 남긴다 — 4초마다 찍으면 저널이 쓰레기가 되고,
             # 아무것도 안 찍으면 원격에서 상태를 확인할 방법이 없다(실제로 겪었다).
-            if mqtt_link.reachable(cli.host, VIDEO_PORT, 0.5):
-                print(f"[video] {cli.host}:{VIDEO_PORT} 재접속 — 파이프라인 재시작", flush=True)
+            # 🔴 영상 host 는 **항상 현재 MQTT 링크에 맞춘다.**
+            #    시작 시 pick() 이 None 이면 vhost 가 hosts[0](유선)로 떨어지는데,
+            #    Link 의 첫 접속은 on_switch 를 부르지 않아(이전 host 없음) 영상만
+            #    유선에 남는다. 유선이 빠져 있으면 라우트가 없어 SYN 도 못 나가고
+            #    2초마다 재시작만 반복한다 — 실측 2026-08-18, 이걸로 카메라가 죽었다.
+            host = cli.host or hosts[0]
+            if mqtt_link.reachable(host, VIDEO_PORT, 0.5):
+                print(f"[video] {host}:{VIDEO_PORT} 재접속 — 파이프라인 재시작", flush=True)
                 vid["up"] = True
                 pipe.set_state(Gst.State.NULL)
+                vsrc.set_property("host", host)     # NULL 상태에서 바꿔야 확실히 먹는다
                 pipe.set_state(Gst.State.PLAYING)
             else:
                 if vid["up"]:
-                    print(f"[video] {cli.host}:{VIDEO_PORT} 닫힘 — 파이프라인 대기"
+                    print(f"[video] {host}:{VIDEO_PORT} 닫힘 — 파이프라인 대기"
                           " (navi 정지?)", flush=True)
                 vid["up"] = False
         finally:
@@ -525,9 +532,9 @@ def main():
             notice["txt"] = f"event {d.get('event')} {d.get('detail', '')}".strip()[:100]
 
     def on_switch(old, new):
-        # 경로가 바뀌면 영상도 따라가야 한다 — 기존 재접속 경로를 그대로 쓴다
-        vsrc.set_property("host", new)
-        request_video_restart()          # 메인 스레드에서 set_state 를 부르면 GUI 가 굳는다
+        # 경로가 바뀌면 영상도 따라간다. host 는 워커가 cli.host 로 맞추므로 여기서 안 만진다
+        # (메인 스레드에서 set_state 를 부르면 GUI 가 굳는다 — 4.12 참고).
+        request_video_restart()
 
     # 유선 우선 · 무선 폴백 (mqtt_link 참고). 콘솔이 죽으면 브로커가 대신 잠금을 발행한다
     # — 조종 화면 없이 구동되는 상태를 막는다.
