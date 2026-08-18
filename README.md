@@ -104,9 +104,18 @@ MQTT 브로커는 **로봇에** 있다(`listener 1883 0.0.0.0`, 익명). IPC 가
 | 브로커 위치 | 로봇 `mqtt_host = 127.0.0.1` (로컬) | ○ 경로 무관 |
 | 리슨 바인딩 | 로봇의 1883·5000·22 전부 `0.0.0.0` | ○ |
 | 재접속 시 상태 복원 | 세 서비스 모두 `on_connect` 에서 재구독 + 구동잠금/스트림 재발행 | ○ |
-| 유선 복귀 | IPC `navi-direct`(10.10.10.74) · 로봇 `ipc-direct`(10.10.10.64) 둘 다 autoconnect 정적 | ○ 케이블만 꽂으면 자동 |
+| 유선 복귀 | IPC `navi-direct`(10.10.10.74) · 로봇 `ipc-direct`(10.10.10.64) 둘 다 autoconnect 정적 | ⚠️ **설정만 확인** — 케이블이 빠져 있어 실측 못 함 |
 
-- ⚠️ IPC enp3s0 에 NM 이 자동생성한 `Wired connection 2`(DHCP, 우선순위 -999)가 남아있다. 지금은 `navi-direct`(우선순위 0)가 이기지만, 혼선 방지로 지우는 게 낫다: `nmcli con delete "Wired connection 2"`.
+> [!warning] 유선은 이 점검에서 **측정되지 않았다**
+> 양쪽 `carrier = 0`(케이블 없음)이라 위 표의 유선 항목은 **설정에서 추론한 것**이다.
+> 케이블을 꽂은 뒤 반드시 확인한다:
+> ```bash
+> ip -br a | grep enp3s0        # 10.10.10.74 가 붙었나
+> cd ~/navifra && python3 pathcheck.py
+> ```
+> 유선 줄이 전부 `○` 이고 콘솔 라벨이 `🔗 유선` 으로 바뀌어야 맞다.
+> **enp3s0 이 UP 인데 주소가 없으면** 다른 프로필이 이긴 것이다 — 그게 자동복귀가 깨지는 유일한 경우다.
+> (그래서 NM 이 자동생성한 중복 프로필 `Wired connection 2`(DHCP, -999)는 2026-08-18 에 삭제했다. `enp3s0` 프로필은 이제 `navi-direct` 하나뿐이다.)
 - `iw` 는 IPC 에 없다. 신호세기는 `/proc/net/wireless` 직독이라 영향 없다(실측 -49 dBm / 87%).
 
 ## 조작
