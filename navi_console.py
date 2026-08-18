@@ -288,11 +288,17 @@ def main():
                 time.sleep(delay)
             # 포트가 안 열려 있으면 파이프라인을 아예 건드리지 않는다 — 헛된 재시작이
             # 위 블로킹을 계속 유발한다. navi 가 돌아오면 그때 붙는다.
+            # 로그는 **전환 시점만** 남긴다 — 4초마다 찍으면 저널이 쓰레기가 되고,
+            # 아무것도 안 찍으면 원격에서 상태를 확인할 방법이 없다(실제로 겪었다).
             if mqtt_link.reachable(cli.host, VIDEO_PORT, 0.5):
+                print(f"[video] {cli.host}:{VIDEO_PORT} 재접속 — 파이프라인 재시작", flush=True)
                 vid["up"] = True
                 pipe.set_state(Gst.State.NULL)
                 pipe.set_state(Gst.State.PLAYING)
             else:
+                if vid["up"]:
+                    print(f"[video] {cli.host}:{VIDEO_PORT} 닫힘 — 파이프라인 대기"
+                          " (navi 정지?)", flush=True)
                 vid["up"] = False
         finally:
             vid["busy"] = False
