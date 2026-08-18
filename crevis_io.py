@@ -18,6 +18,7 @@ Modbus 가 멈춰도 주행이 죽지 않아야 한다.
 """
 import argparse
 import json
+import pathlib
 import subprocess
 import sys
 import time
@@ -99,8 +100,10 @@ def main():
                     help="조그 반복 발행 주기 s (워치독 500ms 미만)")
     ap.add_argument("--restart-cmd",
                     default="ssh -o BatchMode=yes -o ConnectTimeout=5 "
-                            "radxa@10.10.10.64 sudo -n systemctl restart navi",
-                    help="리셋 버튼이 실행할 명령. 키 인증 + sudoers NOPASSWD 가 전제")
+                            "-o StrictHostKeyChecking=accept-new "
+                            "radxa@{host} sudo -n systemctl restart navi",
+                    help="리셋 버튼이 실행할 명령. `{host}` 는 **현재 붙어 있는 경로**로 치환된다"
+                         " (유선/무선). 키 인증 + sudoers NOPASSWD 가 전제")
     ap.add_argument("--restart-cooldown", type=float, default=15.0,
                     help="재시작 재요청 최소 간격 s (재시작 자체가 ~7초)")
     ap.add_argument("--bit-reset", type=int, default=0)
@@ -129,7 +132,8 @@ def main():
                   flush=True)
 
     # 유선 우선 · 무선 폴백 (mqtt_link 참고)
-    cli = mqtt_link.Link(hosts=a.hosts.split(","), port=a.port,
+    hosts = a.hosts.split(",")
+    cli = mqtt_link.Link(hosts=hosts, port=a.port,
                          on_connect=on_connect, on_message=on_message)
 
     def stop_actuator(why):
@@ -182,11 +186,20 @@ def main():
                     print(f"\n[리셋] 쿨다운 중 — {a.restart_cooldown:.0f}초 내 재시작 무시",
                           flush=True)
                 else:
-                    last_restart = now
-                    # 블로킹하면 이 루프가 멈춰 리프트를 세울 주체가 사라진다 → 던지고 잊는다.
-                    # 출력은 상속돼 journalctl --user -u crevis-io 에 남는다.
-                    subprocess.Popen(a.restart_cmd, shell=True)
-                    print(f"\n[리셋] navi 재시작 요청: {a.restart_cmd}", flush=True)
+                    # 🔴 호스트를 **박아두면 안 된다.** 유선 IP 를 상수로 두었더니 무선으로
+                    #    돌던 2026-08-18 에 `Network is unreachable` 로 리셋 버튼이 조용히
+                    #    전부 실패했다(열화상 정지 중이라 급했다). 영상 호스트가 갈라졌던 것과
+                    #    같은 버그다 — 경로의 주인은 Link 하나다.
+                    host = cli.host or mqtt_link.pick(hosts, a.port)
+                    if not host:
+                        print("\n[리셋] 닿는 경로가 없다 — 유선·무선 둘 다 끊김", flush=True)
+                    else:
+                        last_restart = now
+                        cmd = a.restart_cmd.format(host=host)
+                        # 블로킹하면 이 루프가 멈춰 리프트를 세울 주체가 사라진다 → 던지고 잊는다.
+                        # 출력은 상속돼 journalctl --user -u crevis-io 에 남는다.
+                        subprocess.Popen(cmd, shell=True)
+                        print(f"\n[리셋] navi 재시작 요청: {cmd}", flush=True)
 
             cli.tick()
             time.sleep(POLL)
@@ -210,6 +223,11 @@ def selftest():
     assert WIRE["up"] == "ret" and WIRE["down"] == "ext"
     assert json.loads(JOG["up"])["dir"] == "ret"
     assert json.loads(STOP)["duty"] == 0
+
+    # 리셋 명령에 IP 를 박으면 다른 경로에서 조용히 전부 실패한다(2026-08-18). 재발 방지.
+    src = pathlib.Path(__file__).read_text().split("def selftest")[0]
+    assert "radxa@{host}" in src, "restart-cmd 기본값에 {host} 치환자가 없다"
+    assert "10.10.10." not in src, "리셋 명령에 IP 가 박혀 있다"
 
     d = Debounce(2)
     assert d.update(True) is False          # 1샘플 — 아직 확정 아님

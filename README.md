@@ -107,7 +107,9 @@ MQTT 브로커는 **로봇에** 있다(`listener 1883 0.0.0.0`, 익명). IPC 가
 6. 🔴 **MQTT 끊김은 paho keepalive 로 못 잡는다.** 링크가 죽어도 클라이언트는 최대 `1.5 × keepalive` 동안 "연결됨"으로 믿는다 — 실측으로 유선을 막고 15초를 기다려도 죽은 소켓을 붙들고 있었다. 그래서 `mqtt_link` 는 **현재 경로를 2초마다 직접 TCP 프로브**한다. 연속 2회 실패해야 옮기고(프로브 한 번 튀는 걸로 흔들리지 않게), 상위 경로 복귀는 즉시다.
 7. **`video_bps`·`video_fps` 는 `navi.conf` 로 못 바꾼다.** 문서(표 4-2)엔 있지만 `confload.hpp` 가 파싱하는 42개 키에 `video_*` 가 없다 → `config.hpp` 수정 + 보드 재빌드가 필요하다. 참고로 실측 스트림은 **~3.9 Mbps** 로 설정값(2 Mbps)의 두 배다 — rate control 이 목표를 안 지킨다.
 8. 🔴 **영상이 검게 멈추면 좀비 TCP 연결이다.** navi 가 재시작되거나 무선이 튀면 로봇 쪽 소켓만 사라지고 IPC 쪽은 `ESTABLISHED` 로 남는다(half-open). 데이터만 끊기는데 **GStreamer 는 오류를 안 내서** ERROR/EOS 기반 재접속이 영영 안 돈다. 진단은 `ss -tni "dst <robot>:5000"` 의 `bytes_received` 를 두 번 재보면 끝 — 안 늘면 좀비다. 콘솔에 **영상 워치독**(4초 무프레임 → 파이프라인 재시작)을 넣어 자동 복구된다.
-9. 메카넘 부호는 **X-config 가정**이다. 게걸음이 반대로 가면 `joy_teleop.py` 의 `MIX` vy 열 4개만 뒤집는다(전후진·회전과 독립).
+9. 🔴 **경로(유선/무선)를 코드에 박으면 안 된다.** 리셋 버튼의 ssh 명령에 유선 IP 를 상수로 두었더니, 무선으로 돌던 날 버튼을 눌러도 `Network is unreachable` 로 **전부 조용히 실패**했다(로그에만 남는다). 영상 호스트가 갈라졌던 것과 같은 버그 — 경로의 주인은 `mqtt_link.Link` **하나**고, 나머지는 `cli.host` 를 따라간다. `--restart-cmd` 의 `{host}` 가 그것이다.
+10. 🔴 **`python3-gi-cairo` 가 없으면 차폭선만 조용히 안 그려진다.** GUI·영상은 멀쩡하고 draw 핸들러만 `Couldn't find foreign struct converter for 'cairo.Context'` 로 죽는다. `install.sh` 가 확인하지만, 인터넷 없는 IPC 에서는 랩탑(같은 우분투 버전)에서 `apt-get download` → scp → `dpkg -i` 로 넣는다.
+11. 메카넘 부호는 **X-config 가정**이다. 게걸음이 반대로 가면 `joy_teleop.py` 의 `MIX` vy 열 4개만 뒤집는다(전후진·회전과 독립).
 
 ## 리셋 버튼 전제
 
@@ -116,7 +118,7 @@ IO 버튼 bit0 은 로봇에서 `systemctl restart navi` 를 실행한다. 두 �
 ```bash
 # 1) IPC → 로봇 키 인증
 ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519      # 없으면
-ssh-copy-id radxa@10.10.10.64
+ssh-copy-id radxa@10.10.10.64        # 무선(192.168.50.1)도 같은 계정이라 한 번이면 된다
 
 # 2) 로봇에서 그 명령만 비밀번호 없이 허용
 ssh radxa@10.10.10.64
@@ -124,6 +126,8 @@ echo 'radxa ALL=(root) NOPASSWD: /usr/bin/systemctl restart navi' | sudo tee /et
 sudo chmod 0440 /etc/sudoers.d/navi-restart
 sudo visudo -cf /etc/sudoers.d/navi-restart           # parsed OK 확인
 ```
+
+실행되는 명령의 호스트는 **그때 붙어 있는 경로**다(유선이면 `10.10.10.64`, 무선이면 `192.168.50.1`). 무선 IP 의 호스트키가 `known_hosts` 에 없어도 되게 `StrictHostKeyChecking=accept-new` 로 붙는다.
 
 `cmd/reset` 대신 재시작인 이유: `cmd/reset` 은 e-stop 래치만 풀고 **`drive_down`(구동계 초기화 실패)은 못 고친다**. 즉발 래치해제는 콘솔 RESET 버튼이 담당한다.
 

@@ -19,6 +19,30 @@ VIDEO_PORT = 5000
 RECONNECT_S = 2          # 영상 파이프라인 오류 후 재시도 간격
 VIDEO_STALL_S = 4        # 이 시간 동안 프레임이 없으면 파이프라인을 다시 세운다
 
+# ── 차폭 예측선 (1920x1080 프레임 좌표) ───────────────────────────────
+# 2026-08-18 사용자가 바닥 실측해서 그은 선을 픽셀에서 추출한 값이다.
+# 🔴 카메라가 **우측에 치우쳐 장착**돼 있어 좌우가 비대칭인 게 정상이다.
+#    보기 좋게 대칭으로 "정리"하면 실제 폭과 틀어진다. 우측 선이 더 급한 것도
+#    카메라에 더 가깝기 때문이고, 두 선이 하단이 아니라 좌·우 측면으로 빠져나가는 것도
+#    로봇 폭이 근거리 화각보다 넓다는 뜻이다.
+GUIDE_WIDTH = (((0, 579), (661, 509)),        # 좌
+               ((1035, 506), (1919, 792)))    # 우
+# 거리 눈금 — **수평이다.** y 하나만 두고 좌·우 x 는 차폭선에서 계산한다.
+#   좌표 2개를 따로 박아두면 실측 오차 때문에 좌우 높이가 어긋난다(실제로 512 vs 521 로
+#   어긋나 지적받았다). 여기 이렇게 두면 차폭선을 나중에 고쳐도 눈금은 항상 수평이다.
+GUIDE_DIST  = ((517, "1.0 m"),)      # (프레임 y, 라벨)
+TICK_HALF   = 45                     # 눈금 반길이 (프레임 px)
+LABEL_RATIO = 0.015                  # 거리 라벨 크기 = 영상 높이 × 이 값 (2026-08-18: 1/2 로 축소)
+COL_WIDTH   = (1.00, 0.15, 0.15)     # 차폭선 = 빨강
+COL_DIST    = (0.40, 0.75, 0.05)     # 거리 눈금 = 진한 연두 (2026-08-18 사용자 지정, 하늘색에서 변경)
+FRAME_W, FRAME_H = 1920, 1080
+
+
+def guide_tick_xs(y):
+    """거리선 높이 y 에서 좌·우 차폭선의 x. 수평이므로 y 하나로 양쪽이 정해진다."""
+    return [x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+            for (x0, y0), (x1, y1) in GUIDE_WIDTH]
+
 
 def fmt_state(d):
     """state JSON → 화면에 뿌릴 (구동, 센서, 경고) 문자열 3개. 없는 필드는 '-' 로 둔다."""
@@ -228,6 +252,7 @@ def main():
     if a.selftest:
         return selftest()
 
+    import cairo                    # 라벨 굵기 지정(FONT_WEIGHT_BOLD)에 필요
     import gi
     gi.require_version("Gtk", "3.0")
     gi.require_version("Gst", "1.0")
@@ -339,6 +364,57 @@ def main():
     # 열화상 PiP — IR 영상 위에 중앙하단으로 얹는다. 프레임이 안 오면 그냥 안 보인다.
     overlay = Gtk.Overlay()
     overlay.add(video)
+
+    # 차폭 예측선 — 영상 위에 cairo 로 얹는다. gtksink 는 종횡비를 유지해 레터박스를
+    # 넣으므로 **영상이 실제로 그려진 사각형**을 구해 그 안에서 정규화 좌표를 쓴다
+    # (창 크기가 바뀌어도 선이 영상에 붙어 있어야 한다).
+    guide = {"on": True}
+
+    def on_draw_guide(area, cr):
+        if not guide.get("logged"):
+            guide["logged"] = True
+            print(f"[guide] draw 호출됨 alloc={area.get_allocated_width()}x"
+                  f"{area.get_allocated_height()} on={guide['on']}", flush=True)
+        if not guide["on"]:
+            return False
+        aw, ah = area.get_allocated_width(), area.get_allocated_height()
+        if ah <= 0 or aw <= 0:
+            return False
+        ar = FRAME_W / FRAME_H
+        if aw / ah > ar:                       # 위젯이 더 넓다 → 좌우 레터박스
+            vw, vh, ox, oy = ah * ar, ah, (aw - ah * ar) / 2, 0
+        else:                                  # 위젯이 더 높다 → 상하 레터박스
+            vw, vh, ox, oy = aw, aw / ar, 0, (ah - aw / ar) / 2
+
+        def P(x, y):
+            return ox + x / FRAME_W * vw, oy + y / FRAME_H * vh
+
+        cr.set_line_width(max(2.0, vh * 0.006))
+        cr.set_source_rgba(*COL_WIDTH, 0.92)               # 차폭선
+        for (x0, y0), (x1, y1) in GUIDE_WIDTH:
+            cr.move_to(*P(x0, y0))
+            cr.line_to(*P(x1, y1))
+        cr.stroke()
+
+        cr.set_source_rgba(*COL_DIST, 0.95)                # 거리 눈금(수평)
+        for ty, _ in GUIDE_DIST:
+            for tx in guide_tick_xs(ty):
+                cr.move_to(*P(tx - TICK_HALF, ty))
+                cr.line_to(*P(tx + TICK_HALF, ty))
+        cr.stroke()
+
+        # PIL 미리보기는 DejaVuSans-Bold 였는데 cairo 는 굵기를 안 줘서 화면만 얇았다
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(max(5.5, vh * LABEL_RATIO))
+        for ty, lab in GUIDE_DIST:
+            cr.move_to(*P(guide_tick_xs(ty)[-1] + TICK_HALF + 12, ty + 12))
+            cr.show_text(lab)
+        return False
+
+    guide_area = Gtk.DrawingArea()
+    guide_area.connect("draw", on_draw_guide)
+    overlay.add_overlay(guide_area)
+    overlay.set_overlay_pass_through(guide_area, True)     # 터치가 통과해야 한다
     pip = Gtk.Image()
     pip.set_name("pip")
     pip.set_halign(Gtk.Align.CENTER)

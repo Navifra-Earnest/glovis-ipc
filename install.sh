@@ -24,13 +24,18 @@ miss=()
 python3 -c "import paho.mqtt.client" 2>/dev/null || miss+=(python3-paho-mqtt)
 command -v mosquitto_pub >/dev/null                || miss+=(mosquitto-clients)
 command -v ffmpeg        >/dev/null                || miss+=(ffmpeg)
+# ⚠️ 이게 없으면 차폭선 오버레이만 조용히 안 그려진다 — draw 핸들러에서
+#    "Couldn't find foreign struct converter for 'cairo.Context'" 로 죽고 GUI 는 멀쩡하다.
+python3 -c "import gi, cairo; gi.require_foreign('cairo')" 2>/dev/null || miss+=(python3-gi-cairo)
 if [ ${#miss[@]} -gt 0 ]; then
     echo "   ⚠️ 빠진 패키지: ${miss[*]}"
     echo "      sudo apt install -y ${miss[*]}"
     echo "   설치 후 다시 실행할 것."
+    echo "   인터넷이 없는 IPC 라면 랩탑(같은 우분투 버전)에서 받아 옮긴다:"
+    echo "      apt-get download ${miss[*]} && scp *.deb navifra@<ipc>: && ssh navifra@<ipc> sudo dpkg -i '*.deb'"
     exit 1
 fi
-echo "   OK (paho-mqtt · mosquitto-clients · ffmpeg)"
+echo "   OK (paho-mqtt · mosquitto-clients · ffmpeg · python3-gi-cairo)"
 
 echo "── 서비스 유닛 설치"
 mkdir -p "$HOME/.config/systemd/user"
