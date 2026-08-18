@@ -17,6 +17,7 @@ import mqtt_link
 PORT, PREFIX = 1883, "navi"
 VIDEO_PORT = 5000
 RECONNECT_S = 2          # 영상 파이프라인 오류 후 재시도 간격
+VIDEO_STALL_S = 4        # 이 시간 동안 프레임이 없으면 파이프라인을 다시 세운다
 
 
 def fmt_state(d):
@@ -261,6 +262,30 @@ def main():
     bus = pipe.get_bus()
     bus.add_signal_watch()
     bus.connect("message", on_bus)
+
+    # 🔴 영상 워치독 — ERROR/EOS 만 기다리면 안 된다.
+    #    navi 가 재시작되면 로봇 쪽 소켓만 사라지고 IPC 쪽 TCP 는 ESTABLISHED 로 남는다
+    #    (half-open). 데이터만 끊기는데 GStreamer 는 오류를 내지 않아 위 on_bus 가
+    #    영영 안 불리고 **검은 화면 그대로 방치된다.**
+    #    실측(2026-08-18): bytes_received 가 5초간 42,080,478 에서 미동도 없었고
+    #    로봇은 clients=0, 콘솔 로그엔 아무 오류도 없었다. 사람이 재시작해야 풀렸다.
+    #    → 프레임 도착을 직접 세서 멈추면 다시 세운다. MQTT 쪽(mqtt_link)과 같은 처방이다.
+    frames = {"n": 0, "seen": -1}
+
+    def _count_frame(_pad, _info):
+        frames["n"] += 1
+        return Gst.PadProbeReturn.OK
+
+    vsrc.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, _count_frame)
+
+    def video_watchdog():
+        if frames["n"] == frames["seen"]:
+            print(f"[video] {VIDEO_STALL_S}초 무데이터 — 파이프라인 재시작", flush=True)
+            restart_video()
+        frames["seen"] = frames["n"]
+        return True
+
+    GLib.timeout_add_seconds(VIDEO_STALL_S, video_watchdog)
 
     # ---------- 화면 ----------
     win = Gtk.Window(title="Glovis 화재진압로봇")
