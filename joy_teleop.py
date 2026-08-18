@@ -18,6 +18,7 @@ import argparse, glob, json, math, os, struct, sys, time
 import mqtt_link
 
 WHEEL_RADIUS_M = 0.076   # 실측 후 수정. 속도 스케일에만 영향 — 틀려도 방향은 안 바뀐다
+RPM_PER_MS     = 60.0 / (2.0 * 3.141592653589793 * WHEEL_RADIUS_M)   # m/s → RPM
 MAX_RPM        = 20.0    # 축별 안전 상한 (문서 예제 최대치)
 RAMP           = 0.5
 POLL           = 0.05    # 입력 폴링 주기. 발행 주기(--period)와 분리한다 — 아래 due() 참조
@@ -65,13 +66,20 @@ MIX = ((1.0, -1.0, -1.0),    # FL
        (1.0, -1.0, +1.0))    # RR
 
 
-def mecanum_rpm(vx, vy, wz=0.0, radius=WHEEL_RADIUS_M, max_rpm=MAX_RPM):
-    """(vx, vy, wz) → [FL, FR, RL, RR] RPM. 상한 초과 시 4축을 함께 축소한다."""
+def mecanum_rpm(vx, vy, wz=0.0, radius=WHEEL_RADIUS_M, max_rpm=MAX_RPM, cap=None):
+    """(vx, vy, wz) → [FL, FR, RL, RR] RPM. 상한 초과 시 4축을 **함께** 축소한다.
+
+    cap: 어느 축도 넘지 않을 RPM. 대각선(x·y 동시)은 메카넘 혼합에서 두 바퀴가
+    합산을 받아 **직진의 2배**가 된다 — 직진 [3,3,3,3] vs 대각 [0,6,6,0].
+    체감상 갑자기 튀어나가므로(2026-08-18 사용자 지적) 직진 속도로 상한을 건다.
+    회전+게걸음 같은 혼합 지령에도 같은 보호가 걸린다.
+    """
     k = 60.0 / (2.0 * math.pi * radius)
     rpm = [(a * vx + b * vy + c * wz) * k for a, b, c in MIX]
+    limit = max_rpm if cap is None else min(max_rpm, cap)
     peak = max(abs(r) for r in rpm)
-    if peak > max_rpm:                     # 축별 클램프는 지령 벡터를 회전시킨다 → 전체 스케일
-        rpm = [r * max_rpm / peak for r in rpm]
+    if peak > limit:                       # 축별 클램프는 지령 벡터를 회전시킨다 → 전체 스케일
+        rpm = [r * limit / peak for r in rpm]
     return [round(r, 2) for r in rpm]
 
 
@@ -194,7 +202,9 @@ def main():
             allow, locked = gate(hat.spin, hat.x, hat.y, locked)
             # 구동 잠김이면 스틱을 놓은 것과 똑같이 취급한다 — 아래 정지 경로를 그대로 탄다
             allow = allow and st.get("enabled", False)
-            rpm = mecanum_rpm(vx, vy, wz) if allow else [0.0, 0.0, 0.0, 0.0]
+            # 어느 방향이든 --speed 가 정한 직진 휠속도를 넘지 않게 한다
+            rpm = (mecanum_rpm(vx, vy, wz, cap=a.speed * RPM_PER_MS)
+                   if allow else [0.0, 0.0, 0.0, 0.0])
             now = time.monotonic()
             if any(rpm) and due(rpm, last_rpm, now, last_pub, a.period):
                 cli.publish(a.prefix + "/cmd/wheel",
@@ -237,6 +247,13 @@ def selftest():
 
     diag = mecanum_rpm(0.04, 0.04)                                  # 대각 = 두 축만 구동
     assert diag[0] == 0 and diag[3] == 0 and diag[1] > 0 and diag[2] > 0, diag
+    # 상한 없으면 대각이 직진의 2배다 (메카넘 혼합의 성질)
+    assert abs(diag[1] - 2 * fwd[0]) < 0.02, (diag, fwd)
+    # cap 을 직진 속도로 주면 대각도 그 값을 안 넘는다 (2026-08-18 사용자 요청)
+    capped = mecanum_rpm(0.04, 0.04, cap=0.04 * RPM_PER_MS)
+    assert max(abs(x) for x in capped) <= fwd[0] + 0.02, (capped, fwd)
+    assert capped[1] > 0 and capped[2] > 0 and capped[0] == 0, capped   # 방향은 유지
+    assert mecanum_rpm(0.04, 0, cap=0.04 * RPM_PER_MS) == fwd, "직진은 영향 없어야 한다"
 
     big = mecanum_rpm(10.0, 5.0)                                    # 상한 초과 → 비율 보존 축소
     ref = mecanum_rpm(0.10, 0.05)
