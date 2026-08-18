@@ -10,7 +10,7 @@ GTK3 + GStreamer(gtksink) + paho-mqtt. 전부 IPC 에 이미 있는 것만 쓴�
 ⚠️ 조이스틱 주행은 이 프로세스가 아니라 joy_teleop.py 가 담당한다. 일부러 분리했다 —
    구동 명령은 350ms 케이던스를 지켜야 하는데 GUI 렌더링에 막히면 워치독이 로봇을 세운다.
 """
-import argparse, json, os, sys, time
+import argparse, json, os, sys, threading, time
 
 import mqtt_link
 
@@ -250,15 +250,12 @@ def main():
         f"h264parse ! avdec_h264 ! {flip}videoconvert ! gtksink name=vsink sync=false")
     sink, vsrc = pipe.get_by_name("vsink"), pipe.get_by_name("vsrc")
 
-    def restart_video():
-        pipe.set_state(Gst.State.NULL)
-        pipe.set_state(Gst.State.PLAYING)
-        return False
-
+    # request_video_restart 는 아래에서 정의된다(전방참조). 버스 메시지는 파이프라인이
+    # PLAYING 으로 간 뒤에야 오므로 그때는 이미 정의돼 있다.
     def on_bus(_bus, msg):
         # navi 는 보는 사람이 없으면 인코딩도 안 한다 → 연결이 끊기면 조용히 다시 붙는다
         if msg.type in (Gst.MessageType.ERROR, Gst.MessageType.EOS):
-            GLib.timeout_add_seconds(RECONNECT_S, restart_video)
+            request_video_restart(RECONNECT_S)      # 워커 스레드에서 처리 (아래 주석 참고)
     bus = pipe.get_bus()
     bus.add_signal_watch()
     bus.connect("message", on_bus)
@@ -270,19 +267,48 @@ def main():
     #    실측(2026-08-18): bytes_received 가 5초간 42,080,478 에서 미동도 없었고
     #    로봇은 clients=0, 콘솔 로그엔 아무 오류도 없었다. 사람이 재시작해야 풀렸다.
     #    → 프레임 도착을 직접 세서 멈추면 다시 세운다. MQTT 쪽(mqtt_link)과 같은 처방이다.
-    frames = {"n": 0, "seen": -1}
+    vid = {"n": 0, "seen": -1, "busy": False, "up": True}
 
     def _count_frame(_pad, _info):
-        frames["n"] += 1
+        vid["n"] += 1
         return Gst.PadProbeReturn.OK
 
     vsrc.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, _count_frame)
 
+    def _video_worker(delay=0.0):
+        """🔴 파이프라인 상태 전환은 **반드시 이 스레드에서** 한다.
+
+        `set_state(NULL)` 은 스트리밍 스레드가 끝날 때까지 동기적으로 기다린다.
+        죽은 소켓에 묶여 있으면 그대로 블로킹되고, 메인 스레드에서 부르면
+        GTK 메인루프가 멈춰 **"navi_console.py is not responding"** 이 뜬다
+        (실측 2026-08-18: navi 를 끈 상태에서 워치독이 4초마다 부르다가 굳었다).
+        """
+        try:
+            if delay:
+                time.sleep(delay)
+            # 포트가 안 열려 있으면 파이프라인을 아예 건드리지 않는다 — 헛된 재시작이
+            # 위 블로킹을 계속 유발한다. navi 가 돌아오면 그때 붙는다.
+            if mqtt_link.reachable(cli.host, VIDEO_PORT, 0.5):
+                vid["up"] = True
+                pipe.set_state(Gst.State.NULL)
+                pipe.set_state(Gst.State.PLAYING)
+            else:
+                vid["up"] = False
+        finally:
+            vid["busy"] = False
+
+    def request_video_restart(delay=0.0):
+        """중복 요청을 막는다 — 재시작이 진행 중이면 무시한다."""
+        if vid["busy"]:
+            return
+        vid["busy"] = True
+        threading.Thread(target=_video_worker, args=(delay,), daemon=True).start()
+
     def video_watchdog():
-        if frames["n"] == frames["seen"]:
-            print(f"[video] {VIDEO_STALL_S}초 무데이터 — 파이프라인 재시작", flush=True)
-            restart_video()
-        frames["seen"] = frames["n"]
+        stalled = vid["n"] == vid["seen"]
+        vid["seen"] = vid["n"]
+        if stalled:
+            request_video_restart()
         return True
 
     GLib.timeout_add_seconds(VIDEO_STALL_S, video_watchdog)
@@ -495,7 +521,7 @@ def main():
     def on_switch(old, new):
         # 경로가 바뀌면 영상도 따라가야 한다 — 기존 재접속 경로를 그대로 쓴다
         vsrc.set_property("host", new)
-        GLib.idle_add(restart_video)
+        request_video_restart()          # 메인 스레드에서 set_state 를 부르면 GUI 가 굳는다
 
     # 유선 우선 · 무선 폴백 (mqtt_link 참고). 콘솔이 죽으면 브로커가 대신 잠금을 발행한다
     # — 조종 화면 없이 구동되는 상태를 막는다.
@@ -509,12 +535,14 @@ def main():
         cli.tick()
         if not cli.connected:
             lbl_link.set_text("⚠ 링크 없음 — 재접속 중")
-        elif cli.host == hosts[0]:
-            lbl_link.set_text(f"🔗 유선 {cli.host}")
         else:
-            w = mqtt_link.wifi_signal()
-            sig = f"  {w[2]:.0f} dBm ({w[1]}%)" if w else ""
-            lbl_link.set_text(f"📶 무선 {cli.host}{sig}")
+            if cli.host == hosts[0]:
+                txt = f"🔗 유선 {cli.host}"
+            else:
+                w = mqtt_link.wifi_signal()
+                sig = f"  {w[2]:.0f} dBm ({w[1]}%)" if w else ""
+                txt = f"📶 무선 {cli.host}{sig}"
+            lbl_link.set_text(txt if vid["up"] else txt + "   ⚠ 영상 없음")
         return True
     link_tick()
     GLib.timeout_add(1500, link_tick)
