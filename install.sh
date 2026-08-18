@@ -48,6 +48,12 @@ echo "── 서비스 기동"
 systemctl --user enable --now navi-console joy-teleop crevis-io
 
 echo
+echo "── 경로 점검 (유선·무선 양쪽에서 전 기능이 되는지)"
+# 🔴 여기서 실패해도 설치는 계속한다 — 케이블이 안 꽂혀 있을 수도 있다.
+#    다만 **리셋 버튼의 ssh 키**는 이 점검만이 잡아낸다(안 되면 조용히 죽는다, 핸드오프 4.14).
+python3 ./pathcheck.py --secs 3 || true
+
+echo
 echo "── 상태"
 for s in navi-console joy-teleop crevis-io; do
     printf "   %-14s %s\n" "$s" "$(systemctl --user is-active "$s")"
