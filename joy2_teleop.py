@@ -91,6 +91,36 @@ SIGN_YAW = -1.0      # 우스틱 **오른쪽** → 우회전(CW). +wz 는 CCW �
 ROT_ARM_M = 0.10
 
 POLL = 0.02          # 아날로그라 기존(0.05)보다 촘촘히 본다. 발행 주기와는 무관
+
+# 지령 하한은 **두지 않는다.** 한때 크리프(손만 얹혀 있을 때 조금씩 도는 것)를 막으려고
+# 넣었는데 두 번 잘못됐다:
+#   1) 출력 rpm 에 걸었더니 각속도를 1/3 로 줄인 직후 **제자리 회전이 통째로 죽었다**
+#      (회전 지령이 축당 0.44 RPM < 하한 0.5). 크리프와 "의도한 느린 회전" 은
+#      rpm 크기로 구분되지 않는다.
+#   2) 입력 쪽으로 옮겨도 **문턱이 두 개**(데드존 + 하한)가 되어 조작 감각이 계단이 된다.
+# 그리고 애초에 **데드맨(LB+RB)이 있다** — 손을 놓으면 즉시 멈춘다(사용자 지적 2026-09-02).
+# 크리프가 실제로 거슬리면 개념이 하나인 **DEAD 를 키운다.** 문턱을 새로 만들지 않는다.
+#
+# ⚠️ 남는 한 가지: 데드맨을 잡은 채 스틱이 살짝 꺾여 있으면 아주 작은 지령이 350ms 마다
+#    계속 나가고, 그러면 "명령이 곧 생존 신호" 인 로봇 워치독이 안 걸린다. 조종자가
+#    붙어 있는 상태라 위험은 낮다. 실제로 관측된 "명령 끝났는데 도는" 현상은 이게
+#    아니었다 — 발행이 끊기고 워치독까지 걸린 뒤에도 RL 이 -0.4 RPM 을 보고했다(MQTT 하류).
+
+# 🔴 무선 패드가 **끊겨도 마지막 입력 상태가 그대로 남는다** — 버튼 집합과 축 값이
+#    메모리에 있으니 데드맨이 눌린 채로 굳고, 로봇은 마지막 명령으로 계속 간다.
+#    (동글을 뽑으면 read 가 죽어서 서비스가 재시작되지만, **컨트롤러만 꺼지면**
+#     노드는 살아있어서 아무 일도 안 일어난다 — 이쪽이 위험하다.)
+#    그래서 입력이 이 시간 이상 없으면 데드맨을 놓은 것으로 본다.
+#
+# 관측(2026-09-02 실주행): 이 타임아웃이 두 번 걸렸는데 **둘 다 유휴 구간**이었다
+#    (데드맨을 놓은 뒤, 또는 패드를 안 만지는 동안) → 주행을 끊지 않았다. 유휴 중에는
+#    어차피 rpm 이 0 이라 무해하다.
+# ⚠️ 다만 **스틱을 끝까지 밀어 붙인 상태**는 아직 검증 못 했다. evdev 는 값이 바뀔 때만
+#    이벤트를 주므로 32767 에 포화되면 이벤트가 끊길 수 있다(EV_SYN 도 빈 sync 는
+#    전달되지 않는 것을 로그로 확인). 그 상태로 2초가 넘으면 주행이 끊긴다.
+#    로그에 주행 중 "패드 입력 끊김" 이 뜨면 --input-timeout 을 올리거나 0 으로 끈다.
+#    오동작 방향이 **정지**라서 켠 채로 쓴다.
+INPUT_TIMEOUT = 2.0
 DEAD = 0.12          # 정규화 데드존. 스틱 중립 드리프트가 주행으로 새는 걸 막는다
 VMAX_HW = MAX_RPM / RPM_PER_MS      # 축 상한(20 RPM)이 정하는 물리 최고속 ≈ 0.159 m/s
 
@@ -133,6 +163,7 @@ def axis_norm(raw, dead=DEAD):
     """원시 축값 → -1.0~+1.0. 데드존 **바깥부터 0 에서 다시 시작**한다.
 
     단순히 데드존 안을 0 으로 만들면 데드존을 넘는 순간 속도가 튄다.
+    문턱은 이 데드존 **하나뿐이다** — 위 주석 참고.
     """
     v = max(-1.0, min(1.0, raw / AX_MAX))
     if abs(v) < dead:
@@ -183,17 +214,19 @@ class Pad:
         self.btn, self.ax, self.edges = set(), {}, []
 
     def poll(self):
-        """읽을 게 없을 때까지 비운다. edges 는 호출자가 소비하고 비운다."""
-        self.edges = []
+        """읽을 게 없을 때까지 비운다. **읽은 이벤트 수**를 돌려준다(입력 끊김 감시용).
+        edges 는 호출자가 소비하고 비운다."""
+        self.edges, n = [], 0
         while True:
             try:
                 data = os.read(self.fd, EV_SIZE)
             except BlockingIOError:
-                return
+                return n
             except OSError:                    # 동글이 빠졌다
                 raise SystemExit("\n패드 연결이 끊겼다 (USB 재삽입 후 서비스 재시작)")
             if len(data) < EV_SIZE:
-                return
+                return n
+            n += 1
             _s, _us, etype, code, val = struct.unpack(EV_FMT, data)
             if etype == EV_KEY:
                 (self.btn.add if val else self.btn.discard)(code)
@@ -242,6 +275,8 @@ def main():
     ap.add_argument("--wmax-step-deg", type=float, default=2.0)
     ap.add_argument("--wmax-lo", type=float, default=2.0)
     ap.add_argument("--wmax-hi", type=float, default=30.0)
+    ap.add_argument("--input-timeout", type=float, default=INPUT_TIMEOUT,
+                    help="패드 입력이 이 시간 없으면 데드맨을 놓은 것으로 본다")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -282,23 +317,33 @@ def main():
 
     vmax, wdeg = a.vmax, a.wmax_deg
     moving, last_rpm, last_pub = False, None, 0.0
+    last_input, stale = time.monotonic(), False
     print(f"장치: {a.dev or '자동'}  주행 {vmax:.3f} m/s · 회전 {wdeg:.1f}°/s\n"
           f"조건: 콘솔 구동허용 **OFF** + LB+RB 홀드 (허용 ON 이면 기존 조이스틱 차례)",
           flush=True)
     try:
         while True:
-            pad.poll()
+            got = pad.poll()
             cli.tick()
+            now = time.monotonic()
+            if got:
+                last_input = now
+                if stale:
+                    stale = False
+                    print("\n[입력] 패드 복구", flush=True)
+            elif a.input_timeout and not stale and now - last_input > a.input_timeout:
+                stale = True
+                print(f"\n⚠ [입력] 패드에서 {a.input_timeout:.1f}초간 아무것도 안 온다 — "
+                      f"정지한다 (컨트롤러 전원·배터리 확인)", flush=True)
             if pad.edges:
                 vmax, wdeg = step_limits(pad.edges, vmax, wdeg, a)
                 print(f"\n[속도] 주행 {vmax:.3f} m/s · 회전 {wdeg:.1f}°/s", flush=True)
 
             vx, vy, wz = resolve(pad.btn, pad.ax, vmax,
                                  math.radians(wdeg) * ROT_ARM_M)
-            if not allowed(st.get("enabled")):
-                vx = vy = wz = 0.0            # 기존 조이스틱 차례 = 손을 뗀 것과 동일 취급
+            if stale or not allowed(st.get("enabled")):
+                vx = vy = wz = 0.0            # 손을 뗀 것과 동일 취급
             rpm = mecanum_rpm(vx, vy, wz, cap=vmax * RPM_PER_MS)
-            now = time.monotonic()
             if any(rpm) and due(rpm, last_rpm, now, last_pub, a.period):
                 cli.publish(a.prefix + "/cmd/wheel",
                             json.dumps({"rpm": rpm, "ramp": RAMP}), qos=1)
@@ -310,7 +355,8 @@ def main():
                 # rpm=[0,0,0,0] 은 절대 보내지 않는다 — 여자 유지로 과전류 e-stop 위험
                 cli.publish(a.prefix + "/cmd/stop", "{}", qos=1)
                 moving = False
-                why = ("대기 — 콘솔 구동허용을 **끄면** 이 패드 차례"
+                why = ("정지 — 패드 입력 끊김" if stale
+                       else "대기 — 콘솔 구동허용을 **끄면** 이 패드 차례"
                        if st.get("enabled") is True
                        else "대기 — 구동허용 상태 수신 전"
                        if st.get("enabled") is None
@@ -368,7 +414,7 @@ def selftest():
     # ── 데드존: 중립 드리프트는 0, 데드존 바깥은 0 에서 다시 시작 ──
     assert axis_norm(int(AX_MAX * 0.05)) == 0.0
     assert axis_norm(int(AX_MAX * DEAD * 0.99)) == 0.0
-    assert 0.0 < axis_norm(int(AX_MAX * (DEAD + 0.01))) < 0.05
+    assert 0.0 < axis_norm(int(AX_MAX * (DEAD + 0.01))) < 0.05, "데드존 밖은 0 에서 시작"
     assert abs(axis_norm(32767) - 1.0) < 1e-6
     assert abs(axis_norm(-32767) + 1.0) < 1e-6
     assert abs(axis_norm(99999)) <= 1.0, "범위를 넘는 값도 ±1 로 잘려야 한다"
@@ -409,6 +455,13 @@ def selftest():
     # 회전 게인: 라벨 °/s → 차체 wz. 1/3 감속 후에도 방향은 유지돼야 한다
     assert ROT_ARM_M > 0
     assert math.radians(6.0) * ROT_ARM_M < math.radians(6.0) * 0.30, "게인이 안 줄었다"
+
+    # 🔴 회귀 방지: **현재 설정으로 제자리 회전이 실제 지령을 만들어야 한다.**
+    #    회전 게인(ROT_ARM_M)이나 기본 각속도를 낮추다가 0 으로 깎이면 회전이 죽는다.
+    #    2026-09-02 에 각속도 1/3 + 출력 하한 조합으로 실제로 죽었다.
+    spin = resolve(both, {AX_YAW: 32767}, 0.0239, math.radians(2.0) * ROT_ARM_M)
+    assert any(mecanum_rpm(*spin, cap=0.0239 * RPM_PER_MS)), \
+        f"현재 회전 게인으로 최대 꺾음이 0 이다 — 회전이 죽는다: {spin}"
 
     # ── 모드가 바뀌어도 횡이동이 되어야 한다 (동글이 글자↔코드를 바꾼다) ──
     for code in BTN_STRAFE:
