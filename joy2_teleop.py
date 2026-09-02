@@ -39,7 +39,8 @@ import time
 import mqtt_link
 # 🔴 기구학·상한·발행 판정은 **기존 파일에서 가져온다.** 부호표(MIX)가 두 곳에 있으면
 #    한쪽만 고쳐서 두 조이스틱이 다르게 도는 사고가 난다.
-from joy_teleop import MAIN_JS_MATCH, MAX_RPM, RAMP, RPM_PER_MS, due, mecanum_rpm
+from joy_teleop import (GHOST_COOLDOWN, MAIN_JS_MATCH, MAX_RPM, RAMP, RPM_PER_MS,
+                        due, ghost, mecanum_rpm)
 
 # struct input_event: timeval(long sec, long usec) + u16 type + u16 code + s32 value
 EV_FMT, EV_SIZE = "llHHi", 24
@@ -305,6 +306,7 @@ def main():
         if msg.topic.endswith("/event"):
             print(f"\n[event] {d}", flush=True)
             return
+        st["rpm_fb"] = tuple(w.get("rpm") for w in d.get("wheels", []))
         cur = (d.get("drive_ok"), d.get("wheels_alive"), bool(d.get("estop")))
         if cur != st.get("last"):
             st["last"] = cur
@@ -317,7 +319,7 @@ def main():
 
     vmax, wdeg = a.vmax, a.wmax_deg
     moving, last_rpm, last_pub = False, None, 0.0
-    last_input, stale = time.monotonic(), False
+    last_input, stale, last_ghost = time.monotonic(), False, 0.0
     print(f"장치: {a.dev or '자동'}  주행 {vmax:.3f} m/s · 회전 {wdeg:.1f}°/s\n"
           f"조건: 콘솔 구동허용 **OFF** + LB+RB 홀드 (허용 ON 이면 기존 조이스틱 차례)",
           flush=True)
@@ -363,6 +365,15 @@ def main():
                        else "정지 (데드맨 해제)"
                        if not all(b in pad.btn for b in BTN_DEADMAN) else "정지")
                 status(why, force=True)
+            # ── 유령 구동 감시: 내가 활성 조종기이고 명령을 안 보내는 중인데 모터가 돈다 ──
+            #    (활성일 때만 본다 — 기존 조이스틱이 주행 중일 때 정지를 쏘면 안 된다)
+            if (not moving and allowed(st.get("enabled"))
+                    and ghost(st.get("rpm_fb"), now - last_pub)
+                    and now - last_ghost >= GHOST_COOLDOWN):
+                last_ghost = now
+                cli.publish(a.prefix + "/cmd/stop", "{}", qos=1)
+                print(f"\n⚠ [유령] 명령이 없는데 모터가 돈다 {st.get('rpm_fb')} — 정지 발행",
+                      flush=True)
             last_rpm = rpm
             time.sleep(POLL)
     except KeyboardInterrupt:
@@ -475,6 +486,10 @@ def selftest():
     from joy_teleop import find_joystick
     assert find_pad(paths=real) != find_joystick(paths=[
         p.replace("-event-joystick", "-joystick") for p in real])
+
+    # ── 유령 감시는 활성 조종기만 — 아니면 서로를 죽인다 ──
+    assert ghost((0.0, 0.0, -0.4, 0.0), 5.0)          # 판정 자체는 joy_teleop 에서 검증
+    assert allowed(True) is False, "허용 ON 이면 유령 감시도 돌지 않아야 한다"
 
     # ── 조종기 선택: 허용 OFF 에서만 활성, **모르는 상태는 막힌다** ──
     assert allowed(False) is True, "허용 OFF = 서브 패드 차례"

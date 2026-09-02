@@ -44,6 +44,31 @@ def gate(spin, x, y, locked):
     return True, False
 
 
+# 유령 구동 감시 — 명령을 안 보내는 중인데 모터가 돌고 있으면 세운다 (사용자 요청 2026-09-02)
+GHOST_RPM = 0.3        # 이 이상이면 "돌고 있다". 유휴 피드백 노이즈는 0.0~0.1 로 관측됐다
+GHOST_GRACE = 1.5      # 마지막 발행 후 이만큼은 봐준다 — cmd/stop 은 0.8초 이지-아웃이다
+GHOST_COOLDOWN = 1.0   # 정지 재발행 최소 간격
+
+
+def ghost(rpm_fb, quiet_s, thresh=GHOST_RPM, grace=GHOST_GRACE):
+    """명령을 안 보내는 중인데 모터가 돌고 있나. quiet_s = 마지막 구동명령 후 경과.
+
+    🔴 로봇의 500ms 워치독은 이걸 못 잡는다. 워치독은 "명령이 끊겼나" 만 보는데,
+    명령이 끊긴 뒤에도 모터가 돌아가는 상황(2026-09-02 실주행에서 RL 이 -0.4 RPM 을
+    8초쯤 보고)은 워치독이 이미 걸린 **다음** 이야기다. 그래서 IPC 가 따로 본다.
+
+    grace 를 두는 이유: `cmd/stop` 은 0.8초 이지-아웃으로 감속한다 — 그 구간의 회전은
+    정상이다. 그보다 오래 남아 있으면 유령이다.
+
+    ⚠️ 이 감시는 **자기가 활성 조종기일 때만** 돌려야 한다. 두 텔레옵이 무조건 돌리면
+    한쪽이 정상 주행하는 동안 다른 쪽이 "명령 없는데 돈다" 로 보고 정지를 쏴서 서로를
+    죽인다. 활성 판정은 콘솔 구동허용(선택 스위치)이 이미 해준다.
+    """
+    if quiet_s < grace or not rpm_fb:
+        return False
+    return max(abs(r or 0.0) for r in rpm_fb) >= thresh
+
+
 def due(rpm, last_rpm, now, last_pub, period):
     """지금 발행해야 하나. 입력이 바뀌면 즉시, 아니면 period 마다.
 
@@ -189,8 +214,9 @@ def main():
             print(f"\n[event] {d}")
             return
         # 거부는 조용하다 → 반영 여부는 state 의 wheels[].rpm 으로만 확인된다
+        st["rpm_fb"] = tuple(w.get("rpm") for w in d.get("wheels", []))
         cur = (d.get("drive_ok"), d.get("wheels_alive"), d.get("estop"),
-               tuple(w.get("rpm") for w in d.get("wheels", [])))
+               st["rpm_fb"])
         if cur != st.get("last"):
             st["last"] = cur
             print(f"\n[state] drive_ok={cur[0]} alive={cur[1]} estop={cur[2]} rpm={cur[3]}")
@@ -202,6 +228,7 @@ def main():
                          on_connect=on_connect, on_message=on_message)
 
     moving, last_rpm, last_pub, locked = False, None, 0.0, False
+    last_ghost = 0.0
     try:
         while True:
             hat.poll()
@@ -235,6 +262,14 @@ def main():
                 msg = ("구동 잠김" if not st.get("enabled", False)
                        else "인터락 — 스틱 중립 후 재개" if locked else "정지")
                 print(f"\r{msg}{' ' * 24}", end="", flush=True)
+            # ── 유령 구동 감시: 내가 활성 조종기이고 명령을 안 보내는 중인데 모터가 돈다 ──
+            if (not moving and st.get("enabled", False)
+                    and ghost(st.get("rpm_fb"), now - last_pub)
+                    and now - last_ghost >= GHOST_COOLDOWN):
+                last_ghost = now
+                cli.publish(a.prefix + "/cmd/stop", "{}", qos=1)
+                print(f"\n⚠ [유령] 명령이 없는데 모터가 돈다 {st.get('rpm_fb')} — 정지 발행",
+                      flush=True)
             last_rpm = rpm
             time.sleep(POLL)
     except KeyboardInterrupt:
@@ -299,6 +334,14 @@ def selftest():
     assert "-event-" not in find_joystick(paths=[
         "/dev/input/by-id/usb-©Microsoft_Corporation_Controller_0D9C01C-event-joystick",
         "/dev/input/by-id/usb-©Microsoft_Corporation_Controller_0D9C01C-joystick"])
+
+    # 유령 구동 판정: 이지-아웃 구간은 봐주고, 그 뒤에 남아 있으면 잡는다
+    assert not ghost((0.0, 0.0, 0.0, 0.0), 5.0)
+    assert not ghost((-0.0, -0.1, -0.1, 0.0), 5.0), "유휴 노이즈로는 안 터진다"
+    assert ghost((0.0, 0.0, -0.4, 0.0), 5.0), "실측된 유령(-0.4)은 잡아야 한다"
+    assert not ghost((0.0, 0.0, -0.4, 0.0), 0.5), "cmd/stop 이지-아웃 구간은 정상"
+    assert not ghost(None, 5.0) and not ghost((), 5.0), "state 수신 전에는 판단 보류"
+    assert ghost((3.0, -3.0, -3.0, 3.0), 5.0), "정상 주행 크기가 명령 없이 남으면 유령"
 
     # 발행 시점 판정: 변화는 즉시, 무변화는 주기마다
     assert due([3, 3, 3, 3], None, 1.0, 0.0, 0.35)              # 첫 발행
