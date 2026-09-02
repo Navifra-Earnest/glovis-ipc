@@ -44,6 +44,57 @@ def guide_tick_xs(y):
             for (x0, y0), (x1, y1) in GUIDE_WIDTH]
 
 
+# ── 차량 카운터 ───────────────────────────────────────────────────────────
+# 이 로봇은 **차량 아래로 기어들어간다.** 차체가 ToF 시야를 막으면 차 밑, 트이면 차 사이다.
+# (센서 장착 방향은 확인하지 않았다 — 임계값만 사용자가 지정했다. 방향이 다르면
+#  `--under-cm` 만 바꾸면 되고 판정 구조는 그대로다.)
+# 판정 기준은 사용자 지정(2026-09-02):
+#
+#   0.16 m 이하가 3초 유지  → +1대
+#   그 이상이 1초 이상 유지 → 차 사이 통과 중 = 다음 대를 셀 준비
+#
+# 🔴 `under` 은 **valid 를 반드시 본다.** `valid` 는 신호강도 판정이고 false 면 거리값이
+#    쓰레기라 작은 값이 튀어나올 수 있다(fmt_state 주석 참고) — 그걸 "차 밑" 으로 세면
+#    허깨비 차량이 생긴다. 그리고 물리적으로도 **무효 = 위에 반사할 것이 없음 = 차 사이**다.
+#    즉 판정은 하나로 정리된다: `valid 하고 16cm 이하일 때만 차 밑`, 나머지는 전부 차 사이.
+UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 16.0, 3.0, 1.0
+
+
+class VehicleCounter:
+    """지나간 차량 수. 히스테리시스(진입 3초 / 이탈 1초)로 튐과 이중계수를 막는다.
+
+    이탈에 1초를 요구하는 이유: 차 밑에서 거리값이 순간 튀어도(배선·요철) 차에서
+    나온 것으로 보지 않는다. 그래서 한 대를 두 번 세지 않는다.
+    """
+
+    def __init__(self, under_cm=UNDER_CM, under_hold=UNDER_HOLD_S, gap_hold=GAP_HOLD_S):
+        self.under_cm, self.under_hold, self.gap_hold = under_cm, under_hold, gap_hold
+        self.n, self.under, self.raw, self.since = 0, False, None, 0.0
+
+    def reset(self):
+        """카운터만 0 으로. 현재 차 밑인지 여부는 유지한다 —
+        리셋했다고 지금 밑에 있는 차를 다시 세면 안 된다."""
+        self.n = 0
+
+    def feed(self, tof, now):
+        """state.tof 한 샘플. 반환: 이번 호출로 +1 됐나."""
+        cm = tof.get("dist_cm")
+        raw = bool(tof.get("present") and tof.get("valid")
+                   and cm is not None and cm <= self.under_cm)
+        if raw != self.raw:                       # 원시 판정이 바뀌면 타이머를 다시 잡는다
+            self.raw, self.since = raw, now
+        held = now - self.since
+        if raw and not self.under and held >= self.under_hold:
+            self.under, self.n = True, self.n + 1
+            return True
+        if not raw and self.under and held >= self.gap_hold:
+            self.under = False
+        return False
+
+    def text(self):
+        return f"🚗 {self.n}대 통과" + ("  (차 밑)" if self.under else "  (차 사이)")
+
+
 def fmt_state(d):
     """state JSON → 화면에 뿌릴 (구동, 센서, 경고) 문자열 3개. 없는 필드는 '-' 로 둔다."""
     wheels = d.get("wheels") or []
@@ -212,6 +263,49 @@ def selftest():
     assert thermal_stalled({"present": True, "frames": 101}, seen, 20)      # 고정 15초 — 정지
     assert not thermal_stalled({"present": True, "frames": 102}, seen, 21)  # 다시 늘면 해제
     assert not thermal_stalled({"present": False}, seen, 999)     # 없는 장치는 경고 안 냄
+    # ── 차량 카운터 ──
+    def tof(cm, valid=True, present=True):
+        return {"dist_cm": cm, "valid": valid, "present": present}
+
+    c = VehicleCounter()
+    assert c.feed(tof(80), 0.0) is False and c.n == 0          # 차 사이
+    assert c.feed(tof(10), 1.0) is False and c.n == 0          # 진입 — 아직 3초 안 됐다
+    assert c.feed(tof(10), 3.9) is False and c.n == 0
+    assert c.feed(tof(10), 4.0) is True and c.n == 1           # 3초 유지 → +1
+    assert c.feed(tof(10), 9.0) is False and c.n == 1, "유지 중에 또 세면 안 된다"
+    # 차 밑에서 값이 순간 튀어도 1초를 못 넘기면 이탈이 아니다 → 이중계수 없음
+    assert c.feed(tof(80), 9.5) is False and c.under is True
+    assert c.feed(tof(10), 10.0) is False and c.n == 1
+    assert c.feed(tof(10), 20.0) is False and c.n == 1, "재진입으로 세면 안 된다"
+    # 1초 이상 벗어나면 차 사이 → 다음 대를 셀 준비
+    assert c.feed(tof(80), 21.0) is False and c.under is True  # 아직 1초 안 됨
+    assert c.feed(tof(80), 22.1) is False and c.under is False
+    assert c.feed(tof(10), 23.0) is False and c.n == 1
+    assert c.feed(tof(10), 26.0) is True and c.n == 2, "두 번째 차"
+
+    # 🔴 무효값은 절대 차 밑으로 세지 않는다 — false 면 작은 값이 튀어나올 수 있다
+    c2 = VehicleCounter()
+    for t in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0):
+        assert c2.feed(tof(5, valid=False), t) is False
+    assert c2.n == 0, "무효 거리값으로 허깨비 차량이 생겼다"
+    for t in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0):
+        assert c2.feed(tof(5, present=False), t) is False
+    assert c2.n == 0, "센서 없음도 차 밑이 아니다"
+    assert c2.feed(tof(None), 6.0) is False
+
+    # 경계값: 16cm 는 "이하" 라서 포함이다
+    c3 = VehicleCounter()
+    c3.feed(tof(16), 0.0)
+    assert c3.feed(tof(16), 3.0) is True, "0.16 m 는 이하 = 차 밑"
+    c4 = VehicleCounter()
+    c4.feed(tof(17), 0.0)
+    assert c4.feed(tof(17), 5.0) is False and c4.n == 0
+
+    # 리셋은 카운터만 — 지금 차 밑인 사실은 유지한다(리셋 후 재계수 금지)
+    c.reset()
+    assert c.n == 0 and c.under is True
+    assert c.feed(tof(10), 30.0) is False and c.n == 0
+
     print("selftest OK")
 
 
@@ -247,6 +341,12 @@ def main():
                     help="구동 허용 토글 토픽. navi 접두사 밖이라 로봇은 구독하지 않는다")
     ap.add_argument("--dump-layout", action="store_true",
                     help="4초 뒤 위젯 할당 크기를 찍고 종료 (원격에서 비율 확인용)")
+    ap.add_argument("--under-cm", type=float, default=UNDER_CM,
+                    help="이 거리 이하 = 차 밑 (기본 16cm = 0.16m)")
+    ap.add_argument("--under-hold", type=float, default=UNDER_HOLD_S,
+                    help="차 밑 판정 유지시간 s → 이만큼 지나면 +1대")
+    ap.add_argument("--gap-hold", type=float, default=GAP_HOLD_S,
+                    help="차 사이 판정 유지시간 s → 다음 대를 셀 준비")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -459,6 +559,11 @@ def main():
     lbl_drive = Gtk.Label(xalign=0)
     lbl_sensor = Gtk.Label(xalign=0)
     lbl_warn = Gtk.Label(xalign=0)
+    # 차량 카운터는 차 밑에서 눈으로 확인하는 값이라 크게 띄운다.
+    # pack_end 는 **나중에 부른 것이 왼쪽**이다 → btns 를 먼저 팩해야 e-stop·리셋
+    # 버튼이 오른쪽 끝을 유지한다. 터치 조작에서 안전 버튼 위치가 바뀌면 안 된다.
+    lbl_count = Gtk.Label(xalign=0)
+    lbl_count.set_name("count")
     for l in (lbl_link, lbl_drive, lbl_sensor, lbl_warn):
         l.set_line_wrap(True)                        # 자르지 않고 접는다
         l.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
@@ -467,11 +572,14 @@ def main():
 
     btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     bar.pack_end(btns, False, False, 0)
+    bar.pack_end(lbl_count, False, False, 0)      # btns 다음 = 버튼 왼쪽에 놓인다
 
     css = Gtk.CssProvider()
     css.load_from_data(f"""
         label {{ font-size: {a.font_pt}pt; padding: 0 4px; }}
         #warn {{ color: #d00; font-weight: bold; }}
+        #count {{ font-size: {a.font_pt * 2}pt; font-weight: bold; color: #ffd400;
+                  padding: 0 14px; }}
         button {{ font-size: {a.font_pt * 2}pt; font-weight: bold;
                   padding: 0 {a.font_pt}px; margin: 0; }}
         #estop {{ background-image: none; background-color: #c00; color: #fff; }}
@@ -483,6 +591,10 @@ def main():
     Gtk.StyleContext.add_provider_for_screen(scr, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     pip_h = max(60, round(scr.get_height() * a.pip_pct / 100))   # 화면 비례. 1024x768 → 123px
     lbl_warn.set_name("warn")
+
+    counter = VehicleCounter(a.under_cm, a.under_hold, a.gap_hold)
+    prev_estop = {"v": None}        # e-stop 해제(True→False) 를 잡기 위한 직전값
+    lbl_count.set_text(counter.text())
 
     lut = list(build_lut(PALETTES[a.palette]))   # 절대기준이 켜지면 통째로 교체된다
     lut_key = {}                    # 절대기준 LUT 재계산용 (lo,hi 가 바뀔 때만)
@@ -522,14 +634,29 @@ def main():
     tgl.connect("toggled", on_toggle)
     btns.pack_start(tgl, True, True, 0)
 
+    def on_reset_clicked(_w):
+        """E-STOP 해제 버튼. 차량 카운터도 여기서 0 으로 만든다.
+
+        🔴 state 의 estop True→False 전이만 보면 **e-stop 이 안 걸려 있을 때는
+           카운터를 리셋할 방법이 없다**(전이가 없으니까). 사용자 의도는 "리셋 조작으로
+           0 을 만든다" 이므로 버튼 자체에도 건다. 두 경로 다 조종자의 명시적 조작이다.
+        """
+        send("cmd/reset")
+        counter.reset()
+        GLib.idle_add(lbl_count.set_text, counter.text())
+        print("[차량] 리셋 버튼 — 카운터 0 으로", flush=True)
+
     for label, name, topic, payload in (
             ("■ E-STOP", "estop", "cmd/estop", '{"reason":"콘솔 버튼"}'),
-            ("E-STOP 해제", None, "cmd/reset", "{}")):
+            ("E-STOP 해제", None, None, None)):
         b = Gtk.Button(label=label)
         b.set_vexpand(True)                          # 바 높이를 그대로 채운다
         if name:
             b.set_name(name)
-        b.connect("clicked", lambda _w, t=topic, p=payload: send(t, p))
+        if topic is None:
+            b.connect("clicked", on_reset_clicked)
+        else:
+            b.connect("clicked", lambda _w, t=topic, p=payload: send(t, p))
         btns.pack_start(b, True, True, 0)
 
     # ---------- MQTT ----------
@@ -574,6 +701,17 @@ def main():
         except ValueError:
             return
         if sub == "state":
+            # ── 차량 카운터. 리셋은 **e-stop 해제**다(사용자 지정) — 즉 조종자가
+            #    의도적으로 RESET 을 눌렀을 때만 0 이 된다. 접속·재연결로는 안 바뀐다.
+            es = bool(d.get("estop"))
+            if prev_estop["v"] is True and es is False:
+                counter.reset()
+                print("[차량] e-stop 해제 — 카운터 0 으로", flush=True)
+            prev_estop["v"] = es
+            if counter.feed(d.get("tof") or {}, time.monotonic()):
+                print(f"[차량] {counter.n}대 통과", flush=True)
+            GLib.idle_add(lbl_count.set_text, counter.text())
+
             drive, sensor, warn = fmt_state(d)
             act = " · ".join(f"{k}:{v}" for k, v in sorted(alarms.items()))
             GLib.idle_add(lbl_drive.set_text,
