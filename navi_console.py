@@ -362,6 +362,8 @@ def main():
                     help="구동 허용 토글 토픽. navi 접두사 밖이라 로봇은 구독하지 않는다")
     ap.add_argument("--dump-layout", action="store_true",
                     help="4초 뒤 위젯 할당 크기를 찍고 종료 (원격에서 비율 확인용)")
+    ap.add_argument("--lift-block-topic", default="ipc/lift_blocked",
+                    help="crevis-io 가 발행하는 리프트 막힘 알람 (retain)")
     ap.add_argument("--under-cm", type=float, default=UNDER_CM,
                     help="이 거리 이하 = 차 밑 (기본 16cm = 0.16m)")
     ap.add_argument("--under-hold", type=float, default=UNDER_HOLD_S,
@@ -616,6 +618,8 @@ def main():
     pip_h = max(60, round(scr.get_height() * a.pip_pct / 100))   # 화면 비례. 1024x768 → 123px
     lbl_warn.set_name("warn")
 
+    lift_block = {"txt": ""}        # crevis-io 가 알려주는 리프트 막힘 사유
+    warn_state = {"txt": ""}        # 로봇 state 에서 온 경고
     counter = VehicleCounter(a.under_cm, a.under_hold, a.gap_hold)
     prev_estop = {"v": None}        # e-stop 해제(True→False) 를 잡기 위한 직전값
 
@@ -642,6 +646,17 @@ def main():
         return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(out)),
                                                GdkPixbuf.Colorspace.RGB, False, 8, w, h, rs)
 
+
+    def warn_text(base=None):
+        """경고줄 조립. 로봇 state 경고와 IPC 리프트 막힘을 합친다.
+
+        따로 set_text 하면 나중에 온 쪽이 앞의 것을 지운다 — 실제로 그렇게 짰다가
+        리프트 알람이 state 한 줄에 덮여 사라졌다.
+        """
+        if base is not None:
+            warn_state["txt"] = base
+        parts = [x for x in (lift_block["txt"], warn_state["txt"]) if x]
+        return " / ".join(parts)
 
     def send(topic, payload="{}"):
         cli.publish(f"{a.prefix}/{topic}", payload, qos=1)
@@ -697,7 +712,7 @@ def main():
     def on_connect(c, _u, _f, rc):
         c.subscribe([(f"{a.prefix}/state", 0), (f"{a.prefix}/event", 1),
                      (f"{a.prefix}/alarm/#", 1), (f"{a.prefix}/state/online", 1),
-                     (f"{a.prefix}/frame/thermal", 0)])
+                     (f"{a.prefix}/frame/thermal", 0), (a.lift_block_topic, 1)])
         # 프레임 발행은 기본 꺼져 있다 — 켜야 frame/thermal 이 온다
         c.publish(f"{a.prefix}/cmd/stream", json.dumps({"on": True, "fps": 10}), qos=1)
         # 접속할 때마다 무조건 잠금부터 발행한다 — 기본값이 안전이어야 한다
@@ -711,6 +726,16 @@ def main():
         GLib.idle_add(lbl_warn.set_text, notice["txt"])
 
     def on_message(_c, _u, msg):
+        if msg.topic == a.lift_block_topic:      # prefix 밖 토픽 → 먼저 처리한다
+            try:
+                d = json.loads(msg.payload)
+            except ValueError:
+                return
+            lift_block["txt"] = (f"⬆ 리프트 {d.get('reason', '?')}"
+                                 f" — 버튼을 뗐다 다시 누르면 재시도")\
+                if d.get("on") else ""
+            GLib.idle_add(lbl_warn.set_text, warn_text())
+            return
         sub = msg.topic[len(a.prefix) + 1:]
         if sub == "frame/thermal":                   # BMP 바이너리 — json 파싱 전에 걸러야 한다
             try:
@@ -758,7 +783,7 @@ def main():
             if thermal_stalled(d.get("thermal") or {}, th_seen, time.monotonic()):
                 warn = (warn + " / " if warn else "") + \
                     "열화상 정지 — frames 고정(로봇에서 systemctl restart navi 필요)"
-            GLib.idle_add(lbl_warn.set_text, warn)
+            GLib.idle_add(lbl_warn.set_text, warn_text(warn))
         elif sub.startswith("alarm/"):
             key = d.get("key", sub[6:])
             if d.get("active"):

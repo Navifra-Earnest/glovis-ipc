@@ -69,6 +69,66 @@ JOG = {k: json.dumps({"dir": v}) for k, v in WIRE.items()}
 LABEL = {"up": "리프트 상승", "down": "리프트 하강"}
 
 
+# ── 리프트 막힘 판정 (2026-09-02) ─────────────────────────────────────────
+# 차체 하부에 닿은 뒤에도 계속 밀면 모터가 상한다. 그런데 navi 의 자체 보호는
+# **우리 때문에 무력화된다**: 매 `cmd/actuator` 가 jog()→start() 를 부르며
+# `state_` 를 Running 으로, `t0_`·홀 엣지 타이머를 초기화하는데(actuator.hpp:136·144),
+# `start_grace` 가 1000 ms 인 반면 우리는 350 ms 마다 재발행한다 → **홀 정지 판정
+# (`elapsed > start_grace`)이 영영 참이 되지 않는다.** 남는 보호는 `i_avg_ >= 2.0 A`
+# 하나뿐이고, 그마저 걸린 직후 우리 명령이 다시 밀어붙여 차체를 두드린다.
+#
+# 그래서 IPC 가 막는다. 판정은 **위치 변화**가 1차다:
+#
+#   상승 명령 중 홀 카운트가 STALL_S 동안 안 늘어나면 → 막힘
+#
+# 🔴 **절대 위치가 아니다.** 차체 높이는 차마다 달라서 "몇 카운트에서 멈춘다" 는
+#    쓸 수 없다(기준점도 없다 — navi 재시작하면 0부터 센다). 높이가 얼마든
+#    "멈췄다" 는 같으므로 변화량만 본다.
+#
+# 전류는 보조다. 실측(2026-09-02): 무부하 상승 0.87~1.00 A · 발 하중 0.71~1.09 A ·
+# 하강 0.29 A. **무부하와 하중의 간격이 9% 뿐이라 전류만으로는 못 가른다.**
+# 대신 명백한 과전류(navi 의 blocked_current 와 같은 1.5 A)는 즉시 차단한다.
+STALL_S = 1.8          # 이 시간 동안 안 늘어나면 막힘 (기동 램프업 ~1초를 넘겨야 한다)
+STALL_MIN_ADV = 3      # 홀 카운트 이 미만 변화는 노이즈
+BLOCK_CUR_A = 1.5      # 보조 차단 전류
+
+
+def lift_blocked(quiet_s, cur, stall_s=STALL_S, cur_a=BLOCK_CUR_A):
+    """상승을 멈춰야 하나. quiet_s = 엔코더가 마지막으로 늘어난 뒤 경과 시간.
+
+    반환: 멈출 사유 문자열, 아니면 None. 순수 함수라 selftest 로 검증한다.
+
+    **사유를 두 가지로 나눈다** — 조종자에게 뜻이 완전히 다르다:
+      · 엔코더 정지 → `도달`. 차체에 닿았거나 스트로크 끝이다. **정상 완료**다.
+      · 과전류      → `과전류`. 이건 이상이다(무부하 1.0 A · 발하중 1.09 A 실측이라
+                      1.5 A 는 정상 동작에서 나올 수 없는 값이다).
+    같은 문구로 띄우면 "다 올라간 것" 과 "뭔가 잘못된 것" 을 구분할 수 없다.
+    """
+    if cur is not None and cur >= cur_a:
+        return f"과전류 {cur:.2f}A (임계 {cur_a}A) — 상승 중단"
+    if quiet_s >= stall_s:
+        return f"도달 — 엔코더가 {quiet_s:.1f}초간 안 늘어남"
+    return None
+
+
+def status(msg, force=False, _s={"t": 0.0}):
+    """tty 면 한 줄 갱신(\r), 서비스로 돌 때는 **개행해서 journald 에 남긴다**.
+
+    🔴 \r 만 쓰면 journald 에 한 줄도 안 남는다(개행이 없어 커밋되지 않고
+       `[116B blob data]` 로 뭉개진다). 2026-09-02 리프트 전류를 재려는데 **UP 이
+       언제 나갔는지 확인할 방법이 없었다** — joy2_teleop 과 같은 버그였다.
+       발행 주기로 다 남기면 저널이 넘치므로 1초에 한 줄로 줄인다.
+       force=True 는 상태 전이(정지 등) — 빈도와 무관하게 항상 남긴다.
+    """
+    if sys.stdout.isatty():
+        print("\r" + msg, end="", flush=True)
+        return
+    now = time.monotonic()
+    if force or now - _s["t"] >= 1.0:
+        _s["t"] = now
+        print(msg, flush=True)
+
+
 def decide(up, down):
     """버튼 상태 → 리프트 방향("up"/"down"). None 이면 정지.
 
@@ -120,6 +180,12 @@ def main():
                          " (유선/무선). 키 인증 + sudoers NOPASSWD 가 전제")
     ap.add_argument("--restart-cooldown", type=float, default=15.0,
                     help="재시작 재요청 최소 간격 s (재시작 자체가 ~7초)")
+    ap.add_argument("--block-topic", default="ipc/lift_blocked",
+                    help="막힘 알람 토픽 (콘솔이 구독해 경고줄에 띄운다)")
+    ap.add_argument("--stall-s", type=float, default=STALL_S,
+                    help="상승 중 홀 카운트가 이 시간 안 늘면 막힘으로 본다")
+    ap.add_argument("--block-cur", type=float, default=BLOCK_CUR_A,
+                    help="보조 차단 전류 A")
     ap.add_argument("--bit-reset", type=int, default=0)
     ap.add_argument("--bit-up", type=int, default=1)
     ap.add_argument("--bit-down", type=int, default=2)
@@ -144,6 +210,17 @@ def main():
             d = json.loads(msg.payload)
         except ValueError:
             return
+        act = d.get("actuator") or {}
+        st["act_state"], st["act_cur"] = act.get("state"), act.get("current")
+        pos = act.get("position")
+        st["act_pos"] = pos
+        # **늘어난 시각**만 기록한다(줄어드는 건 하강이라 상승 판정과 무관)
+        if pos is not None:
+            base = st.get("adv_pos")
+            if base is None or pos - base >= STALL_MIN_ADV:
+                st["adv_pos"], st["adv_t"] = pos, time.monotonic()
+            elif pos < base:
+                st["adv_pos"] = pos            # 하강으로 기준을 낮춘다
         was, st["estop"] = st["estop"], bool(d.get("estop"))
         if was != st["estop"]:
             print(f"\n[estop] {'래치 — 리셋 버튼으로 해제' if st['estop'] else '해제됨'}",
@@ -156,9 +233,21 @@ def main():
 
     def stop_actuator(why):
         cli.publish(a.prefix + "/cmd/actuator", STOP, qos=1)
-        print(f"\r리프트 정지 ({why}){' ' * 20}", end="", flush=True)
+        status(f"리프트 정지 ({why})", force=True)
 
     io, reset_db, jogging, last_pub, last_restart = None, Debounce(2), None, 0.0, 0.0
+    up_since, blocked = 0.0, None      # 상승 시작 시각 · 막힘 사유(래치)
+
+    def set_blocked(reason):
+        """막힘 래치. 액추에이터를 세우고 콘솔에 알린다.
+
+        래치인 이유: 풀어주면 350 ms 뒤 다시 밀어붙인다 — navi 보호가 무력화된 것과
+        같은 실수다. **버튼을 뗐다 다시 눌러야** 재시도된다.
+        """
+        cli.publish(a.prefix + "/cmd/actuator", STOP, qos=1)
+        cli.publish(a.block_topic, json.dumps({"on": True, "reason": reason}),
+                    qos=1, retain=True)
+        print(f"\n⬆ [리프트] {reason}  (버튼을 뗐다 다시 눌러야 재시도)", flush=True)
     try:
         while True:
             # ── Modbus 읽기 (끊기면 재접속. 그 사이 액추에이터는 세워 둔다) ──
@@ -183,12 +272,37 @@ def main():
             if st["estop"]:
                 want = None       # e-stop 중에는 어차피 거부된다. 의도를 남기지 않는다
 
+            # ── 리프트 막힘: 상승만 본다(하강은 중력이 돕고 바닥/끝단에서 멈춘다) ──
+            now0 = time.monotonic()
+            if want != "up":
+                if blocked:       # 버튼을 뗐다 → 래치 해제
+                    blocked = None
+                    cli.publish(a.block_topic, '{"on":false}', qos=1, retain=True)
+                    print("\n[리프트] 상승 차단 해제 (버튼 뗌)", flush=True)
+                up_since = 0.0
+            else:
+                if not up_since:
+                    up_since = now0
+                    st["adv_t"] = now0        # 기동 램프업을 유예한다
+                if not blocked:
+                    quiet = now0 - max(st.get("adv_t", now0), up_since)
+                    blocked = lift_blocked(quiet, st.get("act_cur"),
+                                           a.stall_s, a.block_cur)
+                    if blocked:
+                        set_blocked(blocked)
+                if blocked:
+                    want = None               # 상승 명령을 무시한다
+
             # ── 조그: 누르고 있는 동안 반복 발행, 놓으면 명시적 정지 ──
             now = time.monotonic()
             if want and (want != jogging or now - last_pub >= a.period):
                 cli.publish(a.prefix + "/cmd/actuator", JOG[want], qos=1)
+                first = want != jogging
                 jogging, last_pub = want, now
-                print(f"\r{LABEL[want]}{' ' * 24}", end="", flush=True)
+                # 누른 순간은 반드시 남긴다(force) — 이후 반복은 1초에 한 줄
+                status(f"{LABEL[want]}  (act {st.get('act_state', '?')} "
+                       f"{st.get('act_cur', '?')}A pos {st.get('act_pos', '?')})",
+                       force=first)
             elif not want and jogging:
                 jogging = None
                 stop_actuator("버튼 뗌" if not st["estop"] else "e-stop")
@@ -232,6 +346,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # retain 알람을 남기면 콘솔에 영영 뜬다 — 나갈 때 반드시 지운다
+        cli.publish(a.block_topic, '{"on":false}', qos=1, retain=True)
         # 🔴 이 프로세스가 죽는 순간에도 액추에이터는 세워야 한다.
         #    주행 중이면 워치독이 대신 세워주지 않는다(위 STOP 주석 참고).
         cli.publish(a.prefix + "/cmd/actuator", STOP, qos=1)
@@ -256,6 +372,22 @@ def selftest():
     assert "{host}" not in UI_RESTART_CMD and "ssh" not in UI_RESTART_CMD
     assert "navi-console" in UI_RESTART_CMD
     assert RESTART_CMD.format(host="1.2.3.4").endswith("systemctl restart navi")
+
+    # ── 리프트 막힘 판정 ──
+    assert lift_blocked(0.0, 0.9) is None
+    assert lift_blocked(1.7, 0.9) is None, "STALL_S 전에는 통과"
+    # 엔코더 정지는 "도달"(정상 완료), 과전류는 "과전류"(이상) — 문구가 갈려야 한다
+    assert "도달" in lift_blocked(1.9, 0.9)
+    assert "과전류" in lift_blocked(0.0, 1.5), "명백한 과전류는 즉시"
+    assert "과전류" in lift_blocked(0.0, 2.4)
+    assert "도달" not in lift_blocked(0.0, 2.4), "과전류를 도달로 알리면 안 된다"
+    # 둘이 동시면 과전류가 이긴다(더 급한 정보다)
+    assert "과전류" in lift_blocked(9.9, 2.0)
+    assert lift_blocked(0.0, None) is None, "전류를 아직 못 받았으면 전류로 안 막는다"
+    assert lift_blocked(2.0, None) is not None, "전류 없어도 위치로는 막는다"
+    # 🔴 실측된 무부하·하중 전류로는 절대 막히면 안 된다 (오작동 = 리프트가 안 올라간다)
+    for cur in (0.29, 0.87, 0.92, 1.00, 1.09):
+        assert lift_blocked(0.5, cur) is None, cur
 
     d = Debounce(2)
     assert d.update(True) is False          # 1샘플 — 아직 확정 아님
