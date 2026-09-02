@@ -5,8 +5,12 @@ IPC 에서 실행한다. 조이스틱(joy_teleop)·콘솔(navi_console)과 **별
 Modbus 가 멈춰도 주행이 죽지 않아야 한다.
 
   버튼 (Crevis discrete input, fn2 addr 0 / 실측 2026-08-14)
-    bit0 = 리셋      → 로봇에서 `systemctl restart navi` (디바운스 상승엣지 1회, 쿨다운 15초)
+    bit0 = 리셋      → ① IPC UI(`navi-console`) 재시작 — 전체화면 복구. 항상 실행
+                         ② 로봇 `systemctl restart navi` — 닿는 경로가 있을 때
+                       (디바운스 상승엣지 1회, 쿨다운 15초)
                        cmd/reset 과 달리 drive_down 까지 복구된다. 콘솔 RESET 버튼은 즉발 래치해제.
+                       ⚠️ UI 재시작 후에는 **구동허용이 잠긴다**(콘솔이 접속 시 잠금 발행) —
+                          다시 주행하려면 콘솔에서 구동허용을 켠다. 안전 기본값이라 의도된 동작이다.
     bit1 = 리프트 UP  → navi/cmd/actuator {"dir":"ret"}   누르고 있는 동안 반복
     bit2 = 리프트 DOWN → navi/cmd/actuator {"dir":"ext"}   〃
 
@@ -54,6 +58,11 @@ WIRE = {"up": "ret", "down": "ext"}
 RESTART_CMD = ("ssh -o BatchMode=yes -o ConnectTimeout=5 "
                "-o StrictHostKeyChecking=accept-new "
                "radxa@{host} sudo -n systemctl restart navi")
+
+# IPC 콘솔(UI) 재시작. 🔴 **키보드·마우스가 없다** — 오류로 전체화면이 풀리면 이 버튼이
+# 유일한 복구 수단이다. 유닛의 ExecStart 에 `--fullscreen` 이 있어서 재시작하면 되돌아온다.
+# 로봇 재시작과 **분리**한다: 네트워크가 죽어도 UI 는 되살려야 한다.
+UI_RESTART_CMD = "systemctl --user restart navi-console"
 
 # duty 를 안 넣으면 보드의 navi.conf 설정값(actuator_duty)을 쓴다 — IPC 에 값을 중복하지 않는다.
 JOG = {k: json.dumps({"dir": v}) for k, v in WIRE.items()}
@@ -104,6 +113,8 @@ def main():
     ap.add_argument("--prefix", default="navi")
     ap.add_argument("--period", type=float, default=0.35,
                     help="조그 반복 발행 주기 s (워치독 500ms 미만)")
+    ap.add_argument("--ui-restart-cmd", default=UI_RESTART_CMD,
+                    help="리셋 버튼이 같이 재시작할 IPC UI. 빈 문자열이면 끈다")
     ap.add_argument("--restart-cmd", default=RESTART_CMD,
                     help="리셋 버튼이 실행할 명령. `{host}` 는 **현재 붙어 있는 경로**로 치환된다"
                          " (유선/무선). 키 인증 + sudoers NOPASSWD 가 전제")
@@ -197,16 +208,24 @@ def main():
                     #    돌던 2026-08-18 에 `Network is unreachable` 로 리셋 버튼이 조용히
                     #    전부 실패했다(열화상 정지 중이라 급했다). 영상 호스트가 갈라졌던 것과
                     #    같은 버그다 — 경로의 주인은 Link 하나다.
+                    last_restart = now
+                    # 블로킹하면 이 루프가 멈춰 리프트를 세울 주체가 사라진다 → 전부 던지고 잊는다.
+                    # 출력은 상속돼 journalctl --user -u crevis-io 에 남는다.
+                    #
+                    # ① IPC UI — 로컬이라 **경로와 무관하게 항상** 재시작한다.
+                    #    전체화면이 풀렸을 때 되돌릴 수단이 이 버튼뿐이다(입력장치 없음).
+                    if a.ui_restart_cmd:
+                        subprocess.Popen(a.ui_restart_cmd, shell=True)
+                        print(f"\n[리셋] IPC UI 재시작: {a.ui_restart_cmd}", flush=True)
+                    # ② 로봇 navi — 경로가 있어야 한다
                     host = cli.host or mqtt_link.pick(hosts, a.port)
                     if not host:
-                        print("\n[리셋] 닿는 경로가 없다 — 유선·무선 둘 다 끊김", flush=True)
+                        print("[리셋] navi 는 건너뜀 — 닿는 경로가 없다(유선·무선 둘 다 끊김)",
+                              flush=True)
                     else:
-                        last_restart = now
                         cmd = a.restart_cmd.format(host=host)
-                        # 블로킹하면 이 루프가 멈춰 리프트를 세울 주체가 사라진다 → 던지고 잊는다.
-                        # 출력은 상속돼 journalctl --user -u crevis-io 에 남는다.
                         subprocess.Popen(cmd, shell=True)
-                        print(f"\n[리셋] navi 재시작 요청: {cmd}", flush=True)
+                        print(f"[리셋] navi 재시작 요청: {cmd}", flush=True)
 
             cli.tick()
             time.sleep(POLL)
@@ -233,6 +252,9 @@ def selftest():
 
     # 리셋 명령에 IP 를 박으면 다른 경로에서 조용히 전부 실패한다(2026-08-18). 재발 방지.
     assert "{host}" in RESTART_CMD, "리셋 명령에 {host} 치환자가 없다 — 경로가 박힌다"
+    # UI 재시작은 로컬이라 호스트가 없어야 한다 — ssh 로 돌리면 경로가 죽을 때 같이 죽는다
+    assert "{host}" not in UI_RESTART_CMD and "ssh" not in UI_RESTART_CMD
+    assert "navi-console" in UI_RESTART_CMD
     assert RESTART_CMD.format(host="1.2.3.4").endswith("systemctl restart navi")
 
     d = Debounce(2)

@@ -126,7 +126,7 @@ MQTT 브로커는 **로봇에** 있다(`listener 1883 0.0.0.0`, 익명). IPC 가
 | 조이스틱 좌/우 | 좌 / 우 게걸음 (메카넘) |
 | **버튼 8 홀드** + 위/아래 | 제자리 회전 (스핀턴, 속도 0.3배) |
 | IO 버튼 bit1 / bit2 | 리프트 UP / DOWN |
-| IO 버튼 bit0 | **로봇 `navi` 서비스 재시작** (쿨다운 15초) |
+| IO 버튼 bit0 | **① IPC UI(`navi-console`) 재시작 + ② 로봇 `navi` 재시작** (쿨다운 15초) |
 | 콘솔 RESET 버튼 | `cmd/reset` — e-stop 래치 즉시 해제 |
 
 ## 알아야 하는 함정
@@ -147,7 +147,19 @@ MQTT 브로커는 **로봇에** 있다(`listener 1883 0.0.0.0`, 익명). IPC 가
 
 ## 리셋 버튼 전제
 
-IO 버튼 bit0 은 로봇에서 `systemctl restart navi` 를 실행한다. 두 가지가 미리 설정돼 있어야 한다:
+IO 버튼 bit0 은 **두 가지**를 한다:
+
+| 순서 | 대상 | 조건 |
+|---|---|---|
+| ① | IPC UI — `systemctl --user restart navi-console` | **항상**. 로컬이라 네트워크와 무관하다 |
+| ② | 로봇 — `ssh radxa@{host} sudo -n systemctl restart navi` | 닿는 경로가 있을 때만 |
+
+**① 이 있는 이유: IPC 에 키보드·마우스가 없다.** 오류로 전체화면이 풀리면 되돌릴 수단이 이 버튼뿐이다. 유닛의 `ExecStart` 에 `--fullscreen` 이 있어서 재시작하면 전체화면으로 돌아온다.
+
+> [!note] UI 재시작 후에는 **구동허용이 잠긴다**
+> 콘솔이 접속할 때마다 `ipc/drive_enable {"on":false}` 를 발행한다(안전 기본값). 다시 주행하려면 콘솔에서 구동허용을 켠다.
+
+② 를 위해 두 가지가 미리 설정돼 있어야 한다:
 
 ```bash
 # 1) IPC → 로봇 키 인증
