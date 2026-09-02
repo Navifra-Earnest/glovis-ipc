@@ -58,7 +58,7 @@ def guide_tick_xs(y):
 #    허깨비 차량이 생긴다. 그리고 물리적으로도 **무효 = 위에 반사할 것이 없음 = 차 사이**다.
 #    즉 판정은 하나로 정리된다: `valid 하고 임계 이하일 때만 차 밑`, 나머지는 전부 차 사이.
 UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 20.0, 3.0, 1.0   # 0.2 m (2026-09-02 사용자 변경)
-MAX_ICONS = 10        # 🚗 탈리 최대 개수. 넘으면 `+N` 으로 잇는다 (바가 밀리면 안 된다)
+ICONS = "🚗 🚗"       # 첫 줄 고정. 대수·상태와 무관하게 그대로 둔다(사용자 지정)
 
 
 class VehicleCounter:
@@ -92,19 +92,14 @@ class VehicleCounter:
             self.under = False
         return False
 
-    def text(self, max_icons=MAX_ICONS):
-        """세 줄로 준다 — 아이콘 탈리 / 대수 / 상태.
+    def text(self):
+        """세 줄로 준다 — 아이콘 / 대수 / 상태.
 
-        차 밑에서 힐끗 보는 값이라 셋을 겹쳐 읽지 않게 나눴다. 첫 줄은 **센 대수만큼
-        🚗 를 늘어놓는 탈리**다(숫자를 안 읽어도 눈으로 대충 잡힌다). 너무 길어지면
-        바가 밀리므로 max_icons 에서 끊고 `+N` 으로 잇는다. **숫자가 정답이고
-        아이콘은 보조**다. n=0 이어도 첫 줄을 비워 세 줄을 유지한다 — 줄 수가 바뀌면
-        하단 바 높이가 들썩여서 영상 영역이 흔들린다.
+        차 밑에서 힐끗 보는 값이라 셋을 겹쳐 읽지 않게 나눴다.
+        첫 줄은 **고정**이다(대수만큼 늘리지 않는다 — 사용자 지정). 그래서 줄 수와
+        폭이 항상 같고, 하단 바 높이가 들썩여 영상 영역이 흔들리는 일이 없다.
         """
-        icons = "🚗 " * min(self.n, max_icons)
-        if self.n > max_icons:
-            icons += f"+{self.n - max_icons} "
-        return (f"{icons.rstrip()}\n{self.n}대 통과\n"
+        return (f"{ICONS}\n{self.n}대 통과\n"
                 f"{'(차 밑)' if self.under else '(차 사이)'}")
 
 
@@ -318,16 +313,14 @@ def selftest():
     for cc in (c3, c4, VehicleCounter()):
         assert cc.text().count("\n") == 2, cc.text()
     assert "차 밑" in c3.text() and "차 사이" in c4.text()
-    # 아이콘 탈리: 대수만큼 늘어놓고, 상한을 넘으면 +N 으로 잇는다
+    # 첫 줄은 **항상 고정** — 대수·상태와 무관해야 한다(폭이 변하면 바가 흔들린다)
     c5 = VehicleCounter()
-    assert c5.text().split("\n")[0] == "", "0대면 첫 줄은 비어 있다(줄 수는 유지)"
-    c5.n = 3
-    assert c5.text().split("\n")[0] == "🚗 🚗 🚗"
-    assert c5.text().split("\n")[1] == "3대 통과"
-    c5.n = MAX_ICONS + 4
-    first = c5.text().split("\n")[0]
-    assert first.count("🚗") == MAX_ICONS and first.endswith("+4"), first
-    assert c5.text().split("\n")[1] == f"{MAX_ICONS + 4}대 통과", "숫자가 정답이다"
+    for n, under in ((0, False), (3, False), (3, True), (99, True)):
+        c5.n, c5.under = n, under
+        lines = c5.text().split("\n")
+        assert lines[0] == ICONS, (n, under, lines[0])
+        assert lines[1] == f"{n}대 통과"
+        assert lines[2] == ("(차 밑)" if under else "(차 사이)")
 
     # 리셋은 카운터만 — 지금 차 밑인 사실은 유지한다(리셋 후 재계수 금지)
     c.reset()
