@@ -9,13 +9,16 @@
   조작 (사용자가 정한 규칙, 2026-09-02)
     LB + RB 홀드   데드맨. **둘 다** 눌러야 움직이고, 떼면 즉시 정지
     왼쪽 스틱 ↑↓   전진 / 후진 (기울인 만큼 비례)
-    X 홀드 + ←→    좌 / 우 횡이동. 이 동안 **회전은 죽는다**
+    X 홀드 + ←→    좌 / 우 횡이동(=차체 전후진 명령). 이 동안 **회전은 죽는다**
     오른쪽 스틱 ←→ 좌 / 우회전 (비례)
     D패드 ↑↓       주행 최대속도 ± (--vmax-step)
     D패드 →←       회전 최대속도 ± (--wmax-step-deg)
 
 🔴 **콘솔 구동허용이 OFF 일 때만 동작한다** — 기존 조이스틱은 ON 에서만 움직이므로
    토글이 조종기 선택 스위치가 되고 이중 명령이 불가능해진다 (allowed() 주석 참고).
+
+⚠️ 연사(터보)가 X(308)에 걸리면 홀드가 100 Hz 로 떨려 횡이동/회전이 요동친다.
+   패드 펌웨어 기능이라 리눅스에서 못 끈다 — TURBO(또는 HOME)+해당 버튼으로 해제한다.
 
 ⚠️ 이 패드는 커널이 js 노드를 안 만든다(hid_nintendo) → **evdev 직독**이다.
    버튼·축 번호는 실측했다(2026-09-02, joy2_map.py): 아래 상수 주석 참고.
@@ -44,7 +47,12 @@ EV_KEY, EV_ABS = 0x01, 0x03
 
 # ── 실측 매핑 (2026-09-02, joy2_map.py) ───────────────────────────────────
 BTN_DEADMAN = (310, 311)   # BTN_TL / BTN_TR = LB / RB (위쪽 어깨). 아래쪽 ZL·ZR 은 312/313
-BTN_STRAFE = 307           # BTN_NORTH = 물리 X 버튼
+# 🔴 이 패드는 실크 인쇄가 **Xbox 배치**(A 아래·B 오른쪽·X 왼쪽·Y 위)인데
+#    hid_nintendo 는 **위치**로 코드를 준다(위=NORTH). Nintendo 배치는 위가 X 라서
+#    이름으로 유추하면 반드시 틀린다. 실측 결과(2026-09-02, 실주행 로그 시간순):
+#        물리 X = 308(WEST)   A = 304(SOUTH)   B = 305(EAST)   Y = 307(NORTH)
+#    처음에 307 로 넣었더니 "X 를 눌러도 횡이동이 안 된다" 가 됐다.
+BTN_STRAFE = 308           # 물리 **X** 버튼 (BTN_WEST)
 AX_FWD, AX_STRAFE, AX_YAW = 1, 0, 3   # ABS_Y, ABS_X(좌스틱), ABS_RX(우스틱 좌우)
 AX_MAX = 32767.0           # 위·왼쪽이 **음수**다 (실측)
 HAT_X, HAT_Y = 16, 17      # D패드. -1/0/+1 로 온다 (아날로그 아님)
@@ -58,20 +66,43 @@ HAT_X, HAT_Y = 16, 17      # D패드. -1/0/+1 로 온다 (아날로그 아님)
 #
 # 각속도는 그대로다 — 좌표계를 90° 돌려도 yaw 의 부호는 바뀌지 않는다(사용자 질문 확인).
 #
-# 🔴 아래 세 부호는 **실기에서 확정한다.** 반대로 가면 해당 줄 하나만 뒤집는다.
-#    (한 번에 하나씩 확인할 것 — 두 개를 같이 뒤집으면 어느 쪽이 문제였는지 못 가린다)
-SIGN_FWD = +1.0      # 사용자 전진 → vy 부호
-SIGN_STRAFE = +1.0   # 사용자 우횡이동 → vx 부호
-SIGN_YAW = +1.0      # 우스틱 오른쪽 → wz 부호 (+wz = CCW = 좌회전)
+# 🔴 부호 조정은 **이 세 줄이 전부다.** 물리적 질문 하나당 상수 하나 —
+#    코드 다른 곳에 `-` 를 두지 않는다(두 곳에 있으면 "한 줄만 뒤집어라" 가 거짓말이 된다).
+#    각 상수는 (스틱 원시 극성 × 장착 보정)을 **합친** 값이다. 스틱은 위·왼쪽이 음수다.
+#    실기에서 **한 번에 하나씩** 확인할 것 — 둘을 같이 뒤집으면 원인을 못 가린다.
+SIGN_FWD = -1.0      # 좌스틱 **위** → 물리적 전진 (위가 음수라 기본이 -1)
+SIGN_STRAFE = -1.0   # 좌스틱 **오른쪽** → 물리적 우횡이동 (2026-09-02 실기에서 반전)
+SIGN_YAW = -1.0      # 우스틱 **오른쪽** → 우회전(CW). +wz 는 CCW 라 기본이 -1
 
 # 회전 지령을 °/s 로 받기 위한 환산 팔길이. mecanum_rpm 의 wz 는 vx·vy 와 같은
 # 단위(선속도)로 들어가므로 (lx+ly)/2 가 필요하다. 차체 치수 미실측(kinematics:false)이라
-# 추정값이다 → **제자리 360° 회전 시간을 재서 보정한다.** 방향에는 영향 없다.
-ROT_ARM_M = 0.30
+# 추정값이고, **회전 속도의 게인이 곧 이 값이다.**
+#
+# 0.30 → 0.10 (2026-09-02): 실기에서 회전이 너무 빨라 사용자가 1/3 을 요청했다.
+# 라벨(°/s)은 규격대로 두고 이 값만 줄였다 — 즉 "0.30 이 3배 과대추정이었다" 로 본다.
+# 제자리 360° 회전 시간을 재면 정확한 값이 나온다. 방향에는 영향 없다.
+ROT_ARM_M = 0.10
 
 POLL = 0.02          # 아날로그라 기존(0.05)보다 촘촘히 본다. 발행 주기와는 무관
 DEAD = 0.12          # 정규화 데드존. 스틱 중립 드리프트가 주행으로 새는 걸 막는다
 VMAX_HW = MAX_RPM / RPM_PER_MS      # 축 상한(20 RPM)이 정하는 물리 최고속 ≈ 0.159 m/s
+
+
+def status(msg, force=False, _s={"t": 0.0}):
+    """tty 면 한 줄 갱신(\r), 서비스로 돌 때는 **개행해서 journald 에 남긴다**.
+
+    🔴 \r 만 쓰면 journald 에 한 줄도 안 남는다(개행이 없으니 커밋되지 않는다).
+       2026-09-02 실주행에서 "횡이동이 안 된다" 를 로그로 확인할 방법이 없었다.
+       발행 주기(~3회/s)로 다 남기면 저널이 넘치므로 1초에 한 줄로 줄인다.
+       force=True 는 상태 전이(정지 등) — 빈도와 무관하게 항상 남긴다.
+    """
+    if sys.stdout.isatty():
+        print("\r" + msg, end="", flush=True)
+        return
+    now = time.monotonic()
+    if force or now - _s["t"] >= 1.0:
+        _s["t"] = now
+        print(msg, flush=True)
 
 
 def allowed(enabled):
@@ -102,12 +133,13 @@ def axis_norm(raw, dead=DEAD):
     return math.copysign((abs(v) - dead) / (1.0 - dead), v)
 
 
-def to_body(fwd, strafe, yaw):
-    """사용자 의도(전진, 우횡이동, 좌회전) → 차체 (vx, vy, wz).
+def to_body(ly, lx, rx):
+    """스틱 **원시 극성** 값 → 차체 (vx, vy, wz). 부호 보정이 일어나는 유일한 곳이다.
 
-    **여기가 -90° 장착 보정의 전부다.** fwd 가 vy 로, strafe 가 vx 로 간다.
+    **여기가 -90° 장착 보정의 전부다**: 좌스틱 상하(ly)가 vy 로, 좌우(lx)가 vx 로 간다.
+    로봇의 물리적 전진이 조종자 기준 우측이기 때문이다(파일 상단 주석).
     """
-    return SIGN_STRAFE * strafe, SIGN_FWD * fwd, SIGN_YAW * yaw
+    return SIGN_STRAFE * lx, SIGN_FWD * ly, SIGN_YAW * rx
 
 
 def resolve(btn, ax, vmax, wz_max):
@@ -118,10 +150,11 @@ def resolve(btn, ax, vmax, wz_max):
     """
     if not all(b in btn for b in BTN_DEADMAN):
         return 0.0, 0.0, 0.0
-    fwd = -axis_norm(ax.get(AX_FWD, 0)) * vmax          # 위가 음수 → 뒤집어 전진 +
+    # 여기서는 **부호를 만지지 않는다** — 전부 to_body 의 SIGN_* 가 소유한다
+    ly = axis_norm(ax.get(AX_FWD, 0)) * vmax
     if BTN_STRAFE in btn:
-        return to_body(fwd, axis_norm(ax.get(AX_STRAFE, 0)) * vmax, 0.0)
-    return to_body(fwd, 0.0, -axis_norm(ax.get(AX_YAW, 0)) * wz_max)
+        return to_body(ly, axis_norm(ax.get(AX_STRAFE, 0)) * vmax, 0.0)
+    return to_body(ly, 0.0, axis_norm(ax.get(AX_YAW, 0)) * wz_max)
 
 
 def step_limits(hat_edges, vmax, wdeg, a):
@@ -221,9 +254,12 @@ def main():
         if msg.topic.endswith("/event"):
             print(f"\n[event] {d}", flush=True)
             return
-        if d.get("estop") and not st.get("estop"):
-            print("\n⚠ e-stop 래치 — cmd/reset 만 해제된다", flush=True)
-        st["estop"] = bool(d.get("estop"))
+        cur = (d.get("drive_ok"), d.get("wheels_alive"), bool(d.get("estop")))
+        if cur != st.get("last"):
+            st["last"] = cur
+            print(f"\n[state] drive_ok={cur[0]} alive={cur[1]} estop={cur[2]}", flush=True)
+            if cur[2]:
+                print("        ⚠ e-stop 래치 — cmd/reset 만 해제된다", flush=True)
 
     cli = mqtt_link.Link(hosts=a.hosts.split(","), port=a.port,
                          on_connect=on_connect, on_message=on_message)
@@ -252,8 +288,8 @@ def main():
                             json.dumps({"rpm": rpm, "ramp": RAMP}), qos=1)
                 moving, last_pub = True, now
                 mode = "횡이동" if BTN_STRAFE in pad.btn else "주행  "
-                print(f"\r[{mode}] vx={vx:+.3f} vy={vy:+.3f} wz={wz:+.3f} rpm={rpm}   ",
-                      end="", flush=True)
+                status(f"[{mode}] vx={vx:+.3f} vy={vy:+.3f} wz={wz:+.3f} rpm={rpm}"
+                       f"  btn={sorted(pad.btn)}")
             elif not any(rpm) and moving:
                 # rpm=[0,0,0,0] 은 절대 보내지 않는다 — 여자 유지로 과전류 e-stop 위험
                 cli.publish(a.prefix + "/cmd/stop", "{}", qos=1)
@@ -264,7 +300,7 @@ def main():
                        if st.get("enabled") is None
                        else "정지 (데드맨 해제)"
                        if not all(b in pad.btn for b in BTN_DEADMAN) else "정지")
-                print(f"\r{why}{' ' * 28}", end="", flush=True)
+                status(why, force=True)
             last_rpm = rpm
             time.sleep(POLL)
     except KeyboardInterrupt:
@@ -287,22 +323,31 @@ def selftest():
     assert resolve(both, full, 0.1, 0.1) != (0.0, 0.0, 0.0)
 
     # ── 장착 보정: 사용자 "전진" 은 **vy** 로 나가야 한다 (vx 로 가면 90° 틀린다) ──
-    vx, vy, wz = resolve(both, {AX_FWD: -32767}, 0.1, 0.1)
-    assert vx == 0.0 and abs(vy - 0.1) < 1e-9 and wz == 0.0, (vx, vy, wz)
-    back = resolve(both, {AX_FWD: 32767}, 0.1, 0.1)
-    assert back[1] < 0 and back[0] == 0.0, back
+    #
+    # 🔴 여기서 **부호는 검사하지 않는다.** SIGN_* 는 실기 캘리브레이션 값이라
+    #    뒤집힐 수 있고, 테스트가 그걸 고정하면 부호를 고칠 때마다 테스트가 깨진다
+    #    (2026-09-02 SIGN_STRAFE 반전에서 실제로 그랬다). 검사할 것은 로직이다:
+    #    **어느 축으로 가는가 · 반대 입력이 반대로 나오는가 · 크기가 vmax 인가.**
+    up = resolve(both, {AX_FWD: -32767}, 0.1, 0.1)
+    down = resolve(both, {AX_FWD: 32767}, 0.1, 0.1)
+    assert up[0] == 0.0 and up[2] == 0.0, ("전진이 vy 아닌 축으로 샜다", up)
+    assert abs(abs(up[1]) - 0.1) < 1e-9, up
+    assert up[1] == -down[1] and down[1] != 0.0, ("전/후진이 대칭이 아니다", up, down)
 
     # ── X 홀드: 횡이동이 **vx** 로 나가고 회전은 죽는다 ──
     right = resolve(both | {BTN_STRAFE}, {AX_STRAFE: 32767, AX_YAW: 32767}, 0.1, 0.1)
-    assert abs(right[0] - 0.1) < 1e-9 and right[2] == 0.0, right
     left = resolve(both | {BTN_STRAFE}, {AX_STRAFE: -32767}, 0.1, 0.1)
-    assert left[0] < 0, left
+    assert abs(abs(right[0]) - 0.1) < 1e-9, right
+    assert right[2] == 0.0, ("X 홀드 중에는 회전이 죽어야 한다", right)
+    assert right[0] == -left[0] and left[0] != 0.0, ("좌/우 횡이동이 대칭이 아니다", right, left)
     # X 를 놓으면 좌스틱 좌우는 아무것도 아니다
     assert resolve(both, {AX_STRAFE: 32767}, 0.1, 0.1) == (0.0, 0.0, 0.0)
 
-    # ── 회전: 우스틱 오른쪽 = 우회전(-wz), 왼쪽 = 좌회전(+wz) ──
-    assert resolve(both, {AX_YAW: 32767}, 0.1, 0.5)[2] < 0
-    assert resolve(both, {AX_YAW: -32767}, 0.1, 0.5)[2] > 0
+    # ── 회전: 좌우가 반대이고 크기가 상한이다 ──
+    cw = resolve(both, {AX_YAW: 32767}, 0.1, 0.5)
+    ccw = resolve(both, {AX_YAW: -32767}, 0.1, 0.5)
+    assert cw[2] == -ccw[2] and cw[2] != 0.0, (cw, ccw)
+    assert abs(abs(cw[2]) - 0.5) < 1e-9, cw
 
     # ── 데드존: 중립 드리프트는 0, 데드존 바깥은 0 에서 다시 시작 ──
     assert axis_norm(int(AX_MAX * 0.05)) == 0.0
@@ -314,7 +359,7 @@ def selftest():
 
     # ── 비례 제어: 반쯤 꺾으면 반쯤 속도 (데드존 보정 후) ──
     half = resolve(both, {AX_FWD: -int(AX_MAX * (DEAD + (1 - DEAD) * 0.5))}, 0.1, 0.1)
-    assert abs(half[1] - 0.05) < 0.002, half
+    assert abs(abs(half[1]) - 0.05) < 0.002, half
 
     # ── D패드 속도 조절: 눌린 순간 한 칸, 상·하한에서 멈춘다 ──
     class A:
@@ -335,6 +380,19 @@ def selftest():
         <= v * RPM_PER_MS + 0.02
     assert max(abs(r) for r in mecanum_rpm(*resolve(
         both, {AX_FWD: -32767, AX_YAW: 32767}, VMAX_HW, 0.5))) <= MAX_RPM + 1e-6
+
+    # ── 부호 소유권: 보정은 to_body 한 곳에만 있어야 한다 ──
+    #    resolve 가 부호를 또 만지면 SIGN_* 를 뒤집어도 결과가 안 바뀌거나 두 번 바뀐다
+    import inspect
+    body = inspect.getsource(resolve)
+    assert "-axis_norm" not in body, "resolve 에 부호 보정이 남아 있다 (SIGN_* 가 유일해야 한다)"
+    assert to_body(1.0, 0.0, 0.0) == (0.0, SIGN_FWD, 0.0)
+    assert to_body(0.0, 1.0, 0.0) == (SIGN_STRAFE, 0.0, 0.0)
+    assert to_body(0.0, 0.0, 1.0) == (0.0, 0.0, SIGN_YAW)
+
+    # 회전 게인: 라벨 °/s → 차체 wz. 1/3 감속 후에도 방향은 유지돼야 한다
+    assert ROT_ARM_M > 0
+    assert math.radians(6.0) * ROT_ARM_M < math.radians(6.0) * 0.30, "게인이 안 줄었다"
 
     # ── 조종기 선택: 허용 OFF 에서만 활성, **모르는 상태는 막힌다** ──
     assert allowed(False) is True, "허용 OFF = 서브 패드 차례"

@@ -24,7 +24,11 @@ import time
 EV_FMT, EV_SIZE = "llHHi", 24
 EV_KEY, EV_ABS = 0x01, 0x03
 
-BTN = {304: "A(남)", 305: "B(동)", 306: "C", 307: "X(북)", 308: "Y(서)", 309: "Z",
+# ⚠️ 코드는 **위치**를 뜻한다(SOUTH/EAST/NORTH/WEST). 패드에 인쇄된 글자는 배치마다
+#    다르다 — 실측한 이 패드는 Xbox 배치라 위=Y, 왼쪽=X 다. Nintendo 배치는 그 반대.
+#    그래서 이름표에 위치를 먼저 쓴다. **인쇄 글자로 유추하지 말고 눌러서 확인할 것.**
+BTN = {304: "아래(A)", 305: "오른쪽(B)", 306: "C", 307: "위(Xbox=Y)",
+       308: "왼쪽(Xbox=X)", 309: "Z",
        310: "LB(TL)", 311: "RB(TR)", 312: "LT(TL2)", 313: "RT(TR2)",
        314: "SELECT/-", 315: "START/+", 316: "MODE/홈", 317: "L스틱누름", 318: "R스틱누름",
        319: "THUMB", 544: "D패드↑", 545: "D패드↓", 546: "D패드←", 547: "D패드→"}
@@ -136,6 +140,7 @@ def selftest():
     blob = struct.pack(EV_FMT, 1, 2, EV_KEY, 310, 1)
     assert struct.unpack(EV_FMT, blob)[2:] == (EV_KEY, 310, 1)
     assert name(EV_KEY, 310).startswith("LB")
+    assert "위" in name(EV_KEY, 307) and "왼쪽" in name(EV_KEY, 308), "위치로 표기해야 한다"
     assert name(EV_ABS, 1).startswith("ABS_Y")
     assert name(EV_KEY, 9999) == "code 9999"
     assert 16 in HAT and 17 in HAT, "D패드를 데드존에서 빼지 않으면 안 잡힌다"
