@@ -58,6 +58,7 @@ def guide_tick_xs(y):
 #    허깨비 차량이 생긴다. 그리고 물리적으로도 **무효 = 위에 반사할 것이 없음 = 차 사이**다.
 #    즉 판정은 하나로 정리된다: `valid 하고 임계 이하일 때만 차 밑`, 나머지는 전부 차 사이.
 UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 20.0, 3.0, 1.0   # 0.2 m (2026-09-02 사용자 변경)
+MAX_ICONS = 10        # 🚗 탈리 최대 개수. 넘으면 `+N` 으로 잇는다 (바가 밀리면 안 된다)
 
 
 class VehicleCounter:
@@ -91,9 +92,20 @@ class VehicleCounter:
             self.under = False
         return False
 
-    def text(self):
-        """두 줄로 준다 — 차 밑에서 힐끗 보는 값이라 대수와 상태를 겹쳐 읽지 않게."""
-        return f"🚗 {self.n}대 통과\n{'(차 밑)' if self.under else '(차 사이)'}"
+    def text(self, max_icons=MAX_ICONS):
+        """세 줄로 준다 — 아이콘 탈리 / 대수 / 상태.
+
+        차 밑에서 힐끗 보는 값이라 셋을 겹쳐 읽지 않게 나눴다. 첫 줄은 **센 대수만큼
+        🚗 를 늘어놓는 탈리**다(숫자를 안 읽어도 눈으로 대충 잡힌다). 너무 길어지면
+        바가 밀리므로 max_icons 에서 끊고 `+N` 으로 잇는다. **숫자가 정답이고
+        아이콘은 보조**다. n=0 이어도 첫 줄을 비워 세 줄을 유지한다 — 줄 수가 바뀌면
+        하단 바 높이가 들썩여서 영상 영역이 흔들린다.
+        """
+        icons = "🚗 " * min(self.n, max_icons)
+        if self.n > max_icons:
+            icons += f"+{self.n - max_icons} "
+        return (f"{icons.rstrip()}\n{self.n}대 통과\n"
+                f"{'(차 밑)' if self.under else '(차 사이)'}")
 
 
 def fmt_state(d):
@@ -302,9 +314,20 @@ def selftest():
     c4.feed(tof(UNDER_CM + 1), 0.0)
     assert c4.feed(tof(UNDER_CM + 1), 5.0) is False and c4.n == 0
     assert UNDER_CM == 20.0, "사용자 지정 0.2 m"
-    # 두 줄이어야 한다(대수 / 상태)
-    assert c3.text().count("\n") == 1 and "차 밑" in c3.text()
-    assert "차 사이" in c4.text()
+    # 세 줄이어야 한다(아이콘 / 대수 / 상태). 줄 수가 흔들리면 하단 바 높이가 들썩인다
+    for cc in (c3, c4, VehicleCounter()):
+        assert cc.text().count("\n") == 2, cc.text()
+    assert "차 밑" in c3.text() and "차 사이" in c4.text()
+    # 아이콘 탈리: 대수만큼 늘어놓고, 상한을 넘으면 +N 으로 잇는다
+    c5 = VehicleCounter()
+    assert c5.text().split("\n")[0] == "", "0대면 첫 줄은 비어 있다(줄 수는 유지)"
+    c5.n = 3
+    assert c5.text().split("\n")[0] == "🚗 🚗 🚗"
+    assert c5.text().split("\n")[1] == "3대 통과"
+    c5.n = MAX_ICONS + 4
+    first = c5.text().split("\n")[0]
+    assert first.count("🚗") == MAX_ICONS and first.endswith("+4"), first
+    assert c5.text().split("\n")[1] == f"{MAX_ICONS + 4}대 통과", "숫자가 정답이다"
 
     # 리셋은 카운터만 — 지금 차 밑인 사실은 유지한다(리셋 후 재계수 금지)
     c.reset()
@@ -583,10 +606,11 @@ def main():
     css.load_from_data(f"""
         label {{ font-size: {a.font_pt}pt; padding: 0 4px; }}
         #warn {{ color: #d00; font-weight: bold; }}
-        #count {{ font-size: {a.font_pt * 2}pt; font-weight: bold; color: #ffd400;
+        /* 세 줄이라 2배로 두면 하단 바가 커져 영상이 줄어든다 → 1.5배 */
+        #count {{ font-size: {round(a.font_pt * 1.5)}pt; font-weight: bold; color: #ffd400;
                   padding: 0 14px; }}
-        #count_under {{ font-size: {a.font_pt * 2}pt; font-weight: bold; color: #2ecc40;
-                        padding: 0 14px; }}
+        #count_under {{ font-size: {round(a.font_pt * 1.5)}pt; font-weight: bold;
+                        color: #2ecc40; padding: 0 14px; }}
         button {{ font-size: {a.font_pt * 2}pt; font-weight: bold;
                   padding: 0 {a.font_pt}px; margin: 0; }}
         #estop {{ background-image: none; background-color: #c00; color: #fff; }}
