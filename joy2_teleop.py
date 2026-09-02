@@ -125,6 +125,16 @@ INPUT_TIMEOUT = 2.0
 DEAD = 0.12          # 정규화 데드존. 스틱 중립 드리프트가 주행으로 새는 걸 막는다
 VMAX_HW = MAX_RPM / RPM_PER_MS      # 축 상한(20 RPM)이 정하는 물리 최고속 ≈ 0.159 m/s
 
+# D패드 속도 조절 범위 (사용자 지정 2026-09-02). 흩어진 리터럴 대신 여기 모아두고
+# selftest 가 정합성(하한 ≤ 시작 ≤ 상한, 상한 ≤ 물리 최고속)을 검사한다.
+#
+#   주행  0.02 ─ 0.05 m/s   =  2.5 ─  6.3 RPM   (한 칸 0.01 = 1.26 RPM)
+#   회전  2.0  ─ 6.0  °/s   = 0.44 ─ 1.32 RPM   (한 칸 2.0  = 0.44 RPM)
+#
+# 회전 상한 6°/s 는 1/3 감속 **전**의 기본 회전 속도와 같다(0.30 팔길이 × 2°/s = 1.32 RPM).
+VMAX_START, VMAX_STEP, VMAX_LO, VMAX_HI = 0.0239, 0.01, 0.02, 0.05
+WDEG_START, WDEG_STEP, WDEG_LO, WDEG_HI = 2.0, 2.0, 2.0, 6.0
+
 
 def status(msg, force=False, _s={"t": 0.0}):
     """tty 면 한 줄 갱신(\r), 서비스로 돌 때는 **개행해서 journald 에 남긴다**.
@@ -207,6 +217,17 @@ def step_limits(hat_edges, vmax, wdeg, a):
             min(a.wmax_hi, max(a.wmax_lo, round(wdeg, 2))))
 
 
+class PadGone(Exception):
+    """동글이 빠졌거나 노드가 사라졌다 → 재오픈이 필요하다.
+
+    프로세스를 죽이지 않는 이유: 죽이면 systemd 가 3초마다 재시작하는데, 동글을
+    빼놓고 두면 **재시작 카운터가 1396까지 올라가고**(2026-09-02 실측) 유닛 상태가
+    `activating` 으로 남아 "고장난 것" 처럼 보인다. crevis_io 가 Modbus 끊김을
+    다루는 방식과 같게 **안에서 기다린다.** 동글을 다시 꽂으면(event 번호가 바뀌어도)
+    by-id 로 다시 찾아 붙는다.
+    """
+
+
 class Pad:
     """evdev 논블로킹 리더. 버튼 집합 · 축 값 · D패드 상승엣지만 들고 있는다."""
 
@@ -224,7 +245,7 @@ class Pad:
             except BlockingIOError:
                 return n
             except OSError:                    # 동글이 빠졌다
-                raise SystemExit("\n패드 연결이 끊겼다 (USB 재삽입 후 서비스 재시작)")
+                raise PadGone
             if len(data) < EV_SIZE:
                 return n
             n += 1
@@ -252,7 +273,7 @@ def find_pad(exclude=MAIN_JS_MATCH, paths=None):
     for p in cands:
         if exclude not in p:
             return p
-    raise SystemExit(f"서브 패드를 못 찾았다(기존 {exclude} 제외). 후보: {cands}")
+    return None                        # 없으면 호출자가 기다린다 (PadGone 주석 참고)
 
 
 def main():
@@ -265,17 +286,15 @@ def main():
     ap.add_argument("--enable-topic", default="ipc/drive_enable")
     ap.add_argument("--period", type=float, default=0.35,
                     help="반복 발행 주기 s. 350ms 인 이유는 README 함정 1번")
-    ap.add_argument("--vmax", type=float, default=0.0239,
+    ap.add_argument("--vmax", type=float, default=VMAX_START,
                     help="시작 주행 최대속도 m/s (기본 = 기존 조이스틱과 같은 3 RPM)")
-    # 사용자 규격은 0.1 m/s 스텝인데, 축 상한 20 RPM = 0.159 m/s 라 한 칸만 올려도
-    # 천장이다. 그래서 기본은 0.02(≈2.5 RPM)로 두고 규격값은 인자로 열어 둔다.
-    ap.add_argument("--vmax-step", type=float, default=0.02)
-    ap.add_argument("--vmax-lo", type=float, default=0.02)
-    ap.add_argument("--vmax-hi", type=float, default=round(VMAX_HW, 4))
-    ap.add_argument("--wmax-deg", type=float, default=2.0, help="시작 회전 최대속도 °/s")
-    ap.add_argument("--wmax-step-deg", type=float, default=2.0)
-    ap.add_argument("--wmax-lo", type=float, default=2.0)
-    ap.add_argument("--wmax-hi", type=float, default=30.0)
+    ap.add_argument("--vmax-step", type=float, default=VMAX_STEP)
+    ap.add_argument("--vmax-lo", type=float, default=VMAX_LO)
+    ap.add_argument("--vmax-hi", type=float, default=VMAX_HI)
+    ap.add_argument("--wmax-deg", type=float, default=WDEG_START, help="시작 회전 최대속도 °/s")
+    ap.add_argument("--wmax-step-deg", type=float, default=WDEG_STEP)
+    ap.add_argument("--wmax-lo", type=float, default=WDEG_LO)
+    ap.add_argument("--wmax-hi", type=float, default=WDEG_HI)
     ap.add_argument("--input-timeout", type=float, default=INPUT_TIMEOUT,
                     help="패드 입력이 이 시간 없으면 데드맨을 놓은 것으로 본다")
     ap.add_argument("--selftest", action="store_true")
@@ -283,8 +302,7 @@ def main():
     if a.selftest:
         return selftest()
 
-    pad = Pad(a.dev or find_pad())
-    st = {}
+    pad, st = None, {}
 
     def on_connect(c, u, flags, rc):
         c.subscribe([(a.prefix + "/state", 0), (a.prefix + "/event", 1),
@@ -320,12 +338,46 @@ def main():
     vmax, wdeg = a.vmax, a.wmax_deg
     moving, last_rpm, last_pub = False, None, 0.0
     last_input, stale, last_ghost = time.monotonic(), False, 0.0
-    print(f"장치: {a.dev or '자동'}  주행 {vmax:.3f} m/s · 회전 {wdeg:.1f}°/s\n"
+    print(f"주행 {vmax:.3f} m/s ({vmax * RPM_PER_MS:.1f} RPM) · 회전 {wdeg:.1f}°/s\n"
           f"조건: 콘솔 구동허용 **OFF** + LB+RB 홀드 (허용 ON 이면 기존 조이스틱 차례)",
           flush=True)
+    last_wait_log = 0.0
+
+    def stop_now(why):
+        """발행을 끊는 것만으로는 부족하다 — 명시적으로 세운다."""
+        cli.publish(a.prefix + "/cmd/stop", "{}", qos=1)
+        print(f"\n[정지] {why}", flush=True)
+
     try:
         while True:
-            got = pad.poll()
+            # ── 패드가 없으면 **안에서 기다린다** (죽지 않는다 — PadGone 주석 참고) ──
+            if pad is None:
+                path = a.dev or find_pad()
+                now = time.monotonic()
+                if path is None:
+                    if moving:
+                        moving = False
+                        stop_now("패드 없음")
+                    if now - last_wait_log >= 10.0:
+                        last_wait_log = now
+                        print("[패드] 대기 중 — 동글/컨트롤러 전원 확인", flush=True)
+                    cli.tick()
+                    time.sleep(1.0)
+                    continue
+                pad = Pad(path)
+                last_input, stale = now, False
+                print(f"[패드] 연결: {path}", flush=True)
+
+            try:
+                got = pad.poll()
+            except PadGone:
+                pad = None
+                if moving:
+                    moving = False
+                    stop_now("패드 연결 끊김")
+                else:
+                    print("\n[패드] 연결 끊김 — 재연결 대기", flush=True)
+                continue
             cli.tick()
             now = time.monotonic()
             if got:
@@ -379,6 +431,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # 🔴 프로세스가 죽는 순간에도 반드시 세운다
         cli.publish(a.prefix + "/cmd/stop", "{}", qos=1)
         time.sleep(0.2)
         cli.stop()
@@ -435,16 +488,27 @@ def selftest():
     assert abs(abs(half[1]) - 0.05) < 0.002, half
 
     # ── D패드 속도 조절: 눌린 순간 한 칸, 상·하한에서 멈춘다 ──
+    # 실제 설정값을 그대로 쓴다 — 이 테스트가 설정 문서 역할도 한다
     class A:
-        vmax_step, wmax_step_deg = 0.02, 2.0
-        vmax_lo, vmax_hi, wmax_lo, wmax_hi = 0.02, 0.16, 2.0, 30.0
-    assert step_limits([(HAT_Y, -1)], 0.10, 10.0, A) == (0.12, 10.0)   # 위 = 증속
-    assert step_limits([(HAT_Y, +1)], 0.10, 10.0, A) == (0.08, 10.0)   # 아래 = 감속
-    assert step_limits([(HAT_X, +1)], 0.10, 10.0, A) == (0.10, 12.0)   # 오른쪽 = 회전 증속
-    assert step_limits([(HAT_X, -1)], 0.10, 10.0, A) == (0.10, 8.0)
-    assert step_limits([(HAT_Y, +1)], 0.02, 2.0, A) == (0.02, 2.0), "하한에서 더 안 내려간다"
-    assert step_limits([(HAT_Y, -1)], 0.16, 30.0, A) == (0.16, 30.0), "상한에서 더 안 올라간다"
-    assert step_limits([], 0.10, 10.0, A) == (0.10, 10.0)
+        vmax_step, wmax_step_deg = VMAX_STEP, WDEG_STEP
+        vmax_lo, vmax_hi, wmax_lo, wmax_hi = VMAX_LO, VMAX_HI, WDEG_LO, WDEG_HI
+    assert step_limits([(HAT_Y, -1)], 0.03, 4.0, A) == (0.04, 4.0)   # 위 = 증속
+    assert step_limits([(HAT_Y, +1)], 0.03, 4.0, A) == (0.02, 4.0)   # 아래 = 감속
+    assert step_limits([(HAT_X, +1)], 0.03, 4.0, A) == (0.03, 6.0)   # 오른쪽 = 회전 증속
+    assert step_limits([(HAT_X, -1)], 0.03, 4.0, A) == (0.03, 2.0)
+    assert step_limits([(HAT_Y, +1)], VMAX_LO, WDEG_LO, A) == (VMAX_LO, WDEG_LO), \
+        "하한에서 더 안 내려간다"
+    assert step_limits([(HAT_Y, -1)], VMAX_HI, WDEG_HI, A) == (VMAX_HI, WDEG_HI), \
+        "상한에서 더 안 올라간다"
+    assert step_limits([(HAT_X, -1)], 0.03, WDEG_LO, A) == (0.03, WDEG_LO)
+    assert step_limits([], 0.03, 4.0, A) == (0.03, 4.0)
+
+    # 설정 정합성 — 한 곳만 고쳐서 범위가 깨지는 걸 막는다
+    assert VMAX_LO <= VMAX_START <= VMAX_HI, (VMAX_LO, VMAX_START, VMAX_HI)
+    assert WDEG_LO <= WDEG_START <= WDEG_HI, (WDEG_LO, WDEG_START, WDEG_HI)
+    assert 0 < VMAX_STEP <= VMAX_HI - VMAX_LO, "한 칸이 전체 범위보다 크면 조절이 안 된다"
+    assert 0 < WDEG_STEP <= WDEG_HI - WDEG_LO
+    assert VMAX_HI <= VMAX_HW + 1e-9, f"주행 상한이 축 상한({VMAX_HW:.4f} m/s)을 넘는다"
 
     # ── 상한: 어떤 조합도 축 상한을 넘지 않는다 (혼합 지령 포함) ──
     v = 0.05
@@ -483,6 +547,9 @@ def selftest():
     real = ["/dev/input/by-id/usb-_GameSir-Dongle_5F25F811-event-joystick",
             "/dev/input/by-id/usb-©Microsoft_Corporation_Controller_0D9C01C-event-joystick"]
     assert "GameSir" in find_pad(paths=real)
+    # 동글이 없으면 **None** 이어야 한다 — 예외로 죽으면 systemd 재시작 루프가 된다
+    assert find_pad(paths=[real[1]]) is None
+    assert find_pad(paths=[]) is None
     from joy_teleop import find_joystick
     assert find_pad(paths=real) != find_joystick(paths=[
         p.replace("-event-joystick", "-joystick") for p in real])
