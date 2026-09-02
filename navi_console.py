@@ -50,14 +50,14 @@ def guide_tick_xs(y):
 #  `--under-cm` 만 바꾸면 되고 판정 구조는 그대로다.)
 # 판정 기준은 사용자 지정(2026-09-02):
 #
-#   0.16 m 이하가 3초 유지  → +1대
+#   0.2 m 이하가 3초 유지   → +1대
 #   그 이상이 1초 이상 유지 → 차 사이 통과 중 = 다음 대를 셀 준비
 #
 # 🔴 `under` 은 **valid 를 반드시 본다.** `valid` 는 신호강도 판정이고 false 면 거리값이
 #    쓰레기라 작은 값이 튀어나올 수 있다(fmt_state 주석 참고) — 그걸 "차 밑" 으로 세면
 #    허깨비 차량이 생긴다. 그리고 물리적으로도 **무효 = 위에 반사할 것이 없음 = 차 사이**다.
-#    즉 판정은 하나로 정리된다: `valid 하고 16cm 이하일 때만 차 밑`, 나머지는 전부 차 사이.
-UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 16.0, 3.0, 1.0
+#    즉 판정은 하나로 정리된다: `valid 하고 임계 이하일 때만 차 밑`, 나머지는 전부 차 사이.
+UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 20.0, 3.0, 1.0   # 0.2 m (2026-09-02 사용자 변경)
 
 
 class VehicleCounter:
@@ -92,7 +92,8 @@ class VehicleCounter:
         return False
 
     def text(self):
-        return f"🚗 {self.n}대 통과" + ("  (차 밑)" if self.under else "  (차 사이)")
+        """두 줄로 준다 — 차 밑에서 힐끗 보는 값이라 대수와 상태를 겹쳐 읽지 않게."""
+        return f"🚗 {self.n}대 통과\n{'(차 밑)' if self.under else '(차 사이)'}"
 
 
 def fmt_state(d):
@@ -293,13 +294,17 @@ def selftest():
     assert c2.n == 0, "센서 없음도 차 밑이 아니다"
     assert c2.feed(tof(None), 6.0) is False
 
-    # 경계값: 16cm 는 "이하" 라서 포함이다
+    # 경계값: 임계값 자체는 "이하" 라서 포함이다
     c3 = VehicleCounter()
-    c3.feed(tof(16), 0.0)
-    assert c3.feed(tof(16), 3.0) is True, "0.16 m 는 이하 = 차 밑"
+    c3.feed(tof(UNDER_CM), 0.0)
+    assert c3.feed(tof(UNDER_CM), 3.0) is True, "임계값은 이하 = 차 밑"
     c4 = VehicleCounter()
-    c4.feed(tof(17), 0.0)
-    assert c4.feed(tof(17), 5.0) is False and c4.n == 0
+    c4.feed(tof(UNDER_CM + 1), 0.0)
+    assert c4.feed(tof(UNDER_CM + 1), 5.0) is False and c4.n == 0
+    assert UNDER_CM == 20.0, "사용자 지정 0.2 m"
+    # 두 줄이어야 한다(대수 / 상태)
+    assert c3.text().count("\n") == 1 and "차 밑" in c3.text()
+    assert "차 사이" in c4.text()
 
     # 리셋은 카운터만 — 지금 차 밑인 사실은 유지한다(리셋 후 재계수 금지)
     c.reset()
@@ -580,6 +585,8 @@ def main():
         #warn {{ color: #d00; font-weight: bold; }}
         #count {{ font-size: {a.font_pt * 2}pt; font-weight: bold; color: #ffd400;
                   padding: 0 14px; }}
+        #count_under {{ font-size: {a.font_pt * 2}pt; font-weight: bold; color: #2ecc40;
+                        padding: 0 14px; }}
         button {{ font-size: {a.font_pt * 2}pt; font-weight: bold;
                   padding: 0 {a.font_pt}px; margin: 0; }}
         #estop {{ background-image: none; background-color: #c00; color: #fff; }}
@@ -594,7 +601,13 @@ def main():
 
     counter = VehicleCounter(a.under_cm, a.under_hold, a.gap_hold)
     prev_estop = {"v": None}        # e-stop 해제(True→False) 를 잡기 위한 직전값
-    lbl_count.set_text(counter.text())
+
+    def show_count():
+        """차 밑이면 초록(#count_under), 차 사이면 노랑(#count). 이름을 바꿔 끼운다."""
+        lbl_count.set_text(counter.text())
+        lbl_count.set_name("count_under" if counter.under else "count")
+
+    show_count()
 
     lut = list(build_lut(PALETTES[a.palette]))   # 절대기준이 켜지면 통째로 교체된다
     lut_key = {}                    # 절대기준 LUT 재계산용 (lo,hi 가 바뀔 때만)
@@ -643,7 +656,7 @@ def main():
         """
         send("cmd/reset")
         counter.reset()
-        GLib.idle_add(lbl_count.set_text, counter.text())
+        GLib.idle_add(show_count)
         print("[차량] 리셋 버튼 — 카운터 0 으로", flush=True)
 
     for label, name, topic, payload in (
@@ -710,7 +723,7 @@ def main():
             prev_estop["v"] = es
             if counter.feed(d.get("tof") or {}, time.monotonic()):
                 print(f"[차량] {counter.n}대 통과", flush=True)
-            GLib.idle_add(lbl_count.set_text, counter.text())
+            GLib.idle_add(show_count)
 
             drive, sensor, warn = fmt_state(d)
             act = " · ".join(f"{k}:{v}" for k, v in sorted(alarms.items()))
