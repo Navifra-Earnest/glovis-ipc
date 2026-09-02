@@ -39,7 +39,7 @@ import time
 import mqtt_link
 # 🔴 기구학·상한·발행 판정은 **기존 파일에서 가져온다.** 부호표(MIX)가 두 곳에 있으면
 #    한쪽만 고쳐서 두 조이스틱이 다르게 도는 사고가 난다.
-from joy_teleop import MAX_RPM, RAMP, RPM_PER_MS, due, mecanum_rpm
+from joy_teleop import MAIN_JS_MATCH, MAX_RPM, RAMP, RPM_PER_MS, due, mecanum_rpm
 
 # struct input_event: timeval(long sec, long usec) + u16 type + u16 code + s32 value
 EV_FMT, EV_SIZE = "llHHi", 24
@@ -47,12 +47,19 @@ EV_KEY, EV_ABS = 0x01, 0x03
 
 # ── 실측 매핑 (2026-09-02, joy2_map.py) ───────────────────────────────────
 BTN_DEADMAN = (310, 311)   # BTN_TL / BTN_TR = LB / RB (위쪽 어깨). 아래쪽 ZL·ZR 은 312/313
-# 🔴 이 패드는 실크 인쇄가 **Xbox 배치**(A 아래·B 오른쪽·X 왼쪽·Y 위)인데
-#    hid_nintendo 는 **위치**로 코드를 준다(위=NORTH). Nintendo 배치는 위가 X 라서
-#    이름으로 유추하면 반드시 틀린다. 실측 결과(2026-09-02, 실주행 로그 시간순):
-#        물리 X = 308(WEST)   A = 304(SOUTH)   B = 305(EAST)   Y = 307(NORTH)
-#    처음에 307 로 넣었더니 "X 를 눌러도 횡이동이 안 된다" 가 됐다.
-BTN_STRAFE = 308           # 물리 **X** 버튼 (BTN_WEST)
+# 🔴 **이 동글은 모드가 바뀐다** — 그러면 물리 X 버튼의 코드도 바뀐다(실측 2026-09-02):
+#
+#      Switch 모드  057e:2009 → hid_nintendo → **위치**로 코드 부여 → 물리 X = 308
+#      X-input 모드 3537:103e → xpad        → **글자**로 코드 부여 → 물리 X = 307
+#
+#    리눅스 코드 이름이 위치와 어긋나 있어서 그렇다: BTN_X=307 인데 위치는 NORTH(위),
+#    BTN_Y=308 인데 위치는 WEST(왼쪽). 재부팅으로 모드가 바뀌자 "Y 를 눌러야 횡이동이
+#    되는" 상태가 됐다.
+#
+#    → 드라이버를 판별해 고르는 대신 **두 코드를 모두 받는다.** 나머지 면 버튼(A·B)에는
+#      아무 기능이 없으므로 잃는 게 없고, 모드가 바뀌어도 조작이 안 바뀐다.
+#      데드맨 LB/RB(310/311)는 두 모드에서 같다 — 실측 확인.
+BTN_STRAFE = (307, 308)    # 물리 X. 모드에 따라 둘 중 하나로 온다
 AX_FWD, AX_STRAFE, AX_YAW = 1, 0, 3   # ABS_Y, ABS_X(좌스틱), ABS_RX(우스틱 좌우)
 AX_MAX = 32767.0           # 위·왼쪽이 **음수**다 (실측)
 HAT_X, HAT_Y = 16, 17      # D패드. -1/0/+1 로 온다 (아날로그 아님)
@@ -152,7 +159,7 @@ def resolve(btn, ax, vmax, wz_max):
         return 0.0, 0.0, 0.0
     # 여기서는 **부호를 만지지 않는다** — 전부 to_body 의 SIGN_* 가 소유한다
     ly = axis_norm(ax.get(AX_FWD, 0)) * vmax
-    if BTN_STRAFE in btn:
+    if btn & set(BTN_STRAFE):
         return to_body(ly, axis_norm(ax.get(AX_STRAFE, 0)) * vmax, 0.0)
     return to_body(ly, 0.0, axis_norm(ax.get(AX_YAW, 0)) * wz_max)
 
@@ -196,13 +203,22 @@ class Pad:
                 self.ax[code] = val
 
 
-def find_pad():
-    """by-id 로 찾는다 — event 번호는 재연결마다 바뀐다.
-    IMU(`-event-if00`)는 자세 데이터를 초당 수백 개 뿜으므로 반드시 제외한다."""
-    for p in sorted(glob.glob("/dev/input/by-id/*-event-joystick")):
-        if "Microsoft" not in p:               # 기존 디지털 조이스틱은 joy-teleop 담당
+def find_pad(exclude=MAIN_JS_MATCH, paths=None):
+    """by-id 로 찾는다 — event 번호는 재연결·재부팅마다 바뀐다.
+
+    **기존 조이스틱만 배제**하고 나머지를 잡는다. 동글 이름이 모드에 따라
+    `Pro_Controller` ↔ `GameSir-Dongle` 로 바뀌므로 이름을 못 박을 수 없다.
+    joy_teleop 은 반대로 그 이름을 **포함 매칭**하므로 둘이 겹치지 않는다.
+
+    IMU(`-event-if00`)는 자세 데이터를 초당 수백 개 뿜는데 `-event-joystick` 만
+    보므로 자동으로 걸러진다.
+    """
+    cands = paths if paths is not None else sorted(
+        glob.glob("/dev/input/by-id/*-event-joystick"))
+    for p in cands:
+        if exclude not in p:
             return p
-    raise SystemExit("새 패드를 못 찾았다: /dev/input/by-id/*-event-joystick 없음")
+    raise SystemExit(f"서브 패드를 못 찾았다(기존 {exclude} 제외). 후보: {cands}")
 
 
 def main():
@@ -287,7 +303,7 @@ def main():
                 cli.publish(a.prefix + "/cmd/wheel",
                             json.dumps({"rpm": rpm, "ramp": RAMP}), qos=1)
                 moving, last_pub = True, now
-                mode = "횡이동" if BTN_STRAFE in pad.btn else "주행  "
+                mode = "횡이동" if pad.btn & set(BTN_STRAFE) else "주행  "
                 status(f"[{mode}] vx={vx:+.3f} vy={vy:+.3f} wz={wz:+.3f} rpm={rpm}"
                        f"  btn={sorted(pad.btn)}")
             elif not any(rpm) and moving:
@@ -335,8 +351,8 @@ def selftest():
     assert up[1] == -down[1] and down[1] != 0.0, ("전/후진이 대칭이 아니다", up, down)
 
     # ── X 홀드: 횡이동이 **vx** 로 나가고 회전은 죽는다 ──
-    right = resolve(both | {BTN_STRAFE}, {AX_STRAFE: 32767, AX_YAW: 32767}, 0.1, 0.1)
-    left = resolve(both | {BTN_STRAFE}, {AX_STRAFE: -32767}, 0.1, 0.1)
+    right = resolve(both | set(BTN_STRAFE), {AX_STRAFE: 32767, AX_YAW: 32767}, 0.1, 0.1)
+    left = resolve(both | set(BTN_STRAFE), {AX_STRAFE: -32767}, 0.1, 0.1)
     assert abs(abs(right[0]) - 0.1) < 1e-9, right
     assert right[2] == 0.0, ("X 홀드 중에는 회전이 죽어야 한다", right)
     assert right[0] == -left[0] and left[0] != 0.0, ("좌/우 횡이동이 대칭이 아니다", right, left)
@@ -375,7 +391,7 @@ def selftest():
 
     # ── 상한: 어떤 조합도 축 상한을 넘지 않는다 (혼합 지령 포함) ──
     v = 0.05
-    mixed = resolve(both | {BTN_STRAFE}, {AX_FWD: -32767, AX_STRAFE: 32767}, v, 0.1)
+    mixed = resolve(both | set(BTN_STRAFE), {AX_FWD: -32767, AX_STRAFE: 32767}, v, 0.1)
     assert max(abs(r) for r in mecanum_rpm(*mixed, cap=v * RPM_PER_MS)) \
         <= v * RPM_PER_MS + 0.02
     assert max(abs(r) for r in mecanum_rpm(*resolve(
@@ -393,6 +409,19 @@ def selftest():
     # 회전 게인: 라벨 °/s → 차체 wz. 1/3 감속 후에도 방향은 유지돼야 한다
     assert ROT_ARM_M > 0
     assert math.radians(6.0) * ROT_ARM_M < math.radians(6.0) * 0.30, "게인이 안 줄었다"
+
+    # ── 모드가 바뀌어도 횡이동이 되어야 한다 (동글이 글자↔코드를 바꾼다) ──
+    for code in BTN_STRAFE:
+        m = resolve(both | {code}, {AX_STRAFE: 32767}, 0.1, 0.1)
+        assert m[0] != 0.0 and m[2] == 0.0, (code, m)
+
+    # ── 장치 선택: 두 서비스가 같은 장치를 잡으면 안 된다 ──
+    real = ["/dev/input/by-id/usb-_GameSir-Dongle_5F25F811-event-joystick",
+            "/dev/input/by-id/usb-©Microsoft_Corporation_Controller_0D9C01C-event-joystick"]
+    assert "GameSir" in find_pad(paths=real)
+    from joy_teleop import find_joystick
+    assert find_pad(paths=real) != find_joystick(paths=[
+        p.replace("-event-joystick", "-joystick") for p in real])
 
     # ── 조종기 선택: 허용 OFF 에서만 활성, **모르는 상태는 막힌다** ──
     assert allowed(False) is True, "허용 OFF = 서브 패드 차례"

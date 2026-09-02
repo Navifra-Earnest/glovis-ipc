@@ -17,6 +17,10 @@ IPC 에서 실행한다. cmd/body 는 쓰지 않는다 — kinematics:false 면 
 import argparse, glob, json, math, os, struct, sys, time
 import mqtt_link
 
+# 기존 산업용 조이스틱의 by-id 벤더 문자열. joy2_teleop 은 **이걸 배제**해서 고른다
+# → 두 서비스가 같은 장치를 잡는 일이 구조적으로 없다. (2026-09-02)
+MAIN_JS_MATCH = "Microsoft_Corporation"
+
 WHEEL_RADIUS_M = 0.076   # 실측 후 수정. 속도 스케일에만 영향 — 틀려도 방향은 안 바뀐다
 RPM_PER_MS     = 60.0 / (2.0 * 3.141592653589793 * WHEEL_RADIUS_M)   # m/s → RPM
 MAX_RPM        = 20.0    # 축별 안전 상한 (문서 예제 최대치)
@@ -83,18 +87,23 @@ def mecanum_rpm(vx, vy, wz=0.0, radius=WHEEL_RADIUS_M, max_rpm=MAX_RPM, cap=None
     return [round(r, 2) for r in rpm]
 
 
-def find_joystick():
-    """터치스크린이 js0 을 잡고 있으므로 경로를 박지 말고 by-id 로 찾는다.
-    같은 장치가 `-event-joystick`(evdev, 24바이트 이벤트)로도 나오므로 반드시 제외한다.
+def find_joystick(match=MAIN_JS_MATCH, paths=None):
+    """기존 산업용 조이스틱을 **이름으로 못 박아** 찾는다. 경로(js 번호)는 바뀐다.
 
-    ⚠️ 2026-09-02: 두 번째 패드(상용 아날로그, joy2-teleop 담당)가 붙었다. 그 패드를
-    X-input 모드로 바꾸면 이것도 `*-joystick` 으로 잡혀 **둘이 뒤바뀔 수 있다** →
-    이름으로 배제한다. 이 함수는 디지털 4방향 조이스틱 전용이다.
+    🔴 배제 목록으로 하면 안 된다(2026-09-02 실제로 터짐). 서브 패드 동글이
+    X-input 모드로 부팅하면 `usb-_GameSir-Dongle_...-joystick` 이 생기는데,
+    ASCII 로 `_`(0x5F) < `©`(0xC2) 라 **사전순 첫 번째가 그쪽으로 바뀐다.**
+    배제 목록에 넣어둔 "Pro_Controller" 는 그때 이름이 달라져서 안 걸렸다.
+    → 포함 매칭이면 새 장치가 몇 개 붙어도 영향이 없다.
+
+    `-event-joystick`(evdev 24바이트) 은 같은 장치의 다른 인터페이스라 제외한다.
     """
-    for p in sorted(glob.glob("/dev/input/by-id/*-joystick")):
-        if all(x not in p for x in ("TouchController", "-event-", "Pro_Controller")):
+    cands = paths if paths is not None else sorted(
+        glob.glob("/dev/input/by-id/*-joystick"))
+    for p in cands:
+        if match in p and "-event-" not in p:
             return p
-    raise SystemExit("조이스틱을 못 찾았다: /dev/input/by-id/*-joystick 없음")
+    raise SystemExit(f"기존 조이스틱({match})을 못 찾았다. 후보: {cands}")
 
 
 class Hat:
@@ -282,6 +291,14 @@ def selftest():
     assert gate(False, 0.0, -1.0, True) == (False, True)     # y 만 남아도 차단
     assert gate(False, 0.0, 0.0, True) == (True, False)      # 중립 찍음 → 해제
     assert gate(False, -1.0, 0.0, False) == (True, False)    # 평상시 게걸음은 그대로
+
+    # 장치 선택: 서브 패드 동글이 어떤 모드로 붙어도 기존 조이스틱을 고른다
+    real = ["/dev/input/by-id/usb-_GameSir-Dongle_5F25F811-joystick",
+            "/dev/input/by-id/usb-©Microsoft_Corporation_Controller_0D9C01C-joystick"]
+    assert find_joystick(paths=real).endswith("0D9C01C-joystick"), "사전순에 낚이면 안 된다"
+    assert "-event-" not in find_joystick(paths=[
+        "/dev/input/by-id/usb-©Microsoft_Corporation_Controller_0D9C01C-event-joystick",
+        "/dev/input/by-id/usb-©Microsoft_Corporation_Controller_0D9C01C-joystick"])
 
     # 발행 시점 판정: 변화는 즉시, 무변화는 주기마다
     assert due([3, 3, 3, 3], None, 1.0, 0.0, 0.35)              # 첫 발행
