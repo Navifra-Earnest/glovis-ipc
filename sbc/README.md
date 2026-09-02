@@ -16,7 +16,7 @@ ssh navifra@192.168.100.10 \
   'ssh radxa@10.10.10.64 "cd ~/navi_src && tar cz src tools etc Makefile"' > navi_src.tgz
 ```
 
-- `/opt/navi/navi.conf`(설치본)과 `etc/navi.conf`(저장소본)는 채취 시점에 **내용이 동일**했다 → 하나만 보관한다.
+- `/opt/navi/navi.conf`(설치본)과 `etc/navi.conf`(저장소본)는 채취 시점에 **내용이 동일**했다 → 하나만 보관한다. (2026-09-02 재확인: 여전히 동일)
 
 ## 여기 담긴 값이 중요한 이유
 
@@ -29,6 +29,81 @@ ssh navifra@192.168.100.10 \
 | `gear_ratio` | **20.0** | 문서·초기값은 16 이었다. 감속기 실제값 |
 | `overcurrent_a` | **10.0** | 기본 5.0 은 무부하 주행에서도 오트립 |
 | `current_window` | **15** | 기본 5(=400 ms 창)는 스파이크 3개만 몰려도 트립 |
+
+## `system/` — 보드 밖(OS)에 사는 설정 (2026-09-02 추가)
+
+`navi_src/` 는 소스고, 이건 **OS 에 흩어져 있어서 보드를 다시 깔면 통째로 날아가는 것들**이다.
+소스만 백업해두면 로봇은 빌드되지만 **네트워크도 안 붙고 리셋 버튼도 안 먹는다.**
+
+| 파일 | 원래 위치 | 없으면 |
+|---|---|---|
+| `sudoers.d-navi-restart` | `/etc/sudoers.d/navi-restart` (0440 root:root) | **리셋 버튼이 죽는다** (무인 `systemctl restart navi` 불가) |
+| `NetworkManager/ipc-direct.nmconnection` | `/etc/NetworkManager/system-connections/` | 유선(10.10.10.64)이 안 붙는다 |
+| `NetworkManager/navi-ap.nmconnection` | 〃 | **AP(`EV-DL_AP`)가 안 뜬다** = 무선 경로 전멸 |
+| `NetworkManager/navifra.nmconnection` | 〃 | 로봇이 사내 wifi 로 못 붙는다(`autoconnect=false`, 필요할 때만) |
+| `navi.conf.dist` | `/opt/navi/navi.conf.dist` | 기본값 원본 — **우리가 뭘 바꿨는지** 대조용 |
+
+> [!danger] PSK 는 지워서 넣었다
+> `.nmconnection` 의 `psk=` 는 `<핸드오프 노트 6장 참조>` 로 치환돼 있다.
+> **복원할 때 그 줄을 실제 값으로 바꿔야 한다.** 저장소가 public 이라 넣을 수 없다.
+
+복원:
+
+```bash
+sudo install -m 0600 -o root -g root NetworkManager/*.nmconnection \
+     /etc/NetworkManager/system-connections/
+sudo sed -i 's|^psk=.*|psk=<실제값>|' /etc/NetworkManager/system-connections/navi-ap.nmconnection
+sudo nmcli connection reload
+
+sudo install -m 0440 -o root -g root sudoers.d-navi-restart /etc/sudoers.d/navi-restart
+sudo visudo -cf /etc/sudoers.d/navi-restart        # parsed OK 확인
+```
+
+## ⚠️ 이 보드의 시계는 틀려 있다 — **mtime 으로 변경을 판단하면 안 된다**
+
+RTC 가 없고 AP 가 `method=shared`(상류 인터넷 없음)라 NTP 가 동기화되지 않는다:
+
+```
+System clock synchronized: no      NTP service: active
+```
+
+그래서 **오늘 쓴 파일도 `Aug 12` 로 찍히고**, journalctl 도 과거 날짜로 나온다.
+2026-09-02 에 `find -newermt` 로 변경을 찾으려다 헛돌았다 — **내용을 직접 비교해야 한다**:
+
+```bash
+ssh radxa@<robot> 'cd ~/navi_src && tar cz src tools etc Makefile' | tar xz -C /tmp/fresh
+diff -r sbc/navi_src /tmp/fresh
+```
+
+## 대조 결과 (2026-09-02)
+
+| 대상 | 결과 |
+|---|---|
+| `~/navi_src` 전체 (src·tools·etc·Makefile) | **파일 목록·내용 100% 동일** — 8/14 이후 소스 변경 없음 |
+| `/opt/navi/navi.conf` ↔ `navi_src/etc/navi.conf` | 동일 |
+| `/etc/systemd/system/navi.service` ↔ `etc/navi.service` | 동일 |
+| `/etc/mosquitto/conf.d/navi.conf` ↔ `etc/navi-mqtt.conf` | 동일 |
+| udev · modprobe · rc.local | 커스텀 없음 |
+| navi 외 systemd 유닛 | 전부 배포판/벤더 기본 |
+
+## 파일로 백업할 수 없는 것 — **모터 EEPROM**
+
+ID·보레이트·감속비는 파일이 아니라 **각 모터 드라이버의 EEPROM** 에 있다. 모터를 교체하면
+소스·설정을 다 복원해도 안 돈다. 재부여 절차(`tools/nuri_ping.py`, navi 를 **멈추고** 실행):
+
+```bash
+sudo systemctl stop navi                     # 포트(/dev/ttyS2) 점유 해제
+cd ~/navi_src/tools
+python3 nuri_ping.py --scan                  # 현재 보레이트·ID 확인 (공장초기값 9600 / ID 0)
+python3 nuri_ping.py --baud 9600 --id 0 --set-ratio 20     # 감속비 20:1
+python3 nuri_ping.py --baud 9600 --id 0 --set-id 3         # ID (FL1 FR2 RL3 RR4)
+python3 nuri_ping.py --baud 9600 --id 3 --set-baud 115200  # ⚠️ 보레이트는 **맨 마지막**
+sudo systemctl start navi
+```
+
+- EEPROM 쓰기는 **300 ms 이상** 간격을 둔다.
+- 한 번에 **한 축만** 버스에 물린다(ID 가 겹치면 응답이 충돌한다).
+- 보레이트를 먼저 바꾸면 그 뒤 명령이 안 닿는다 → 순서 엄수.
 
 ## 복구 절차 (보드를 새로 깔았을 때)
 

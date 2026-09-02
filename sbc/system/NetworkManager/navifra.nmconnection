@@ -1,0 +1,25 @@
+[connection]
+id=navifra
+uuid=01f116f6-1231-41e5-baf6-77d33a6610aa
+type=wifi
+autoconnect=false
+interface-name=wlP4p65s0
+timestamp=1786327399
+
+[wifi]
+mode=infrastructure
+ssid=navifra
+
+[wifi-security]
+auth-alg=open
+key-mgmt=wpa-psk
+psk=<핸드오프 노트 6장 참조>
+
+[ipv4]
+method=auto
+
+[ipv6]
+addr-gen-mode=default
+method=auto
+
+[proxy]

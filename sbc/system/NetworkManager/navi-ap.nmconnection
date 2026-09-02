@@ -1,0 +1,26 @@
+[connection]
+id=navi-ap
+uuid=2ab20806-12ce-4052-963f-da7a81a64442
+type=wifi
+autoconnect-priority=100
+interface-name=wlP4p65s0
+
+[wifi]
+band=bg
+channel=6
+mode=ap
+ssid=EV-DL_AP
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=<핸드오프 노트 6장 참조>
+
+[ipv4]
+address1=192.168.50.1/24
+method=shared
+
+[ipv6]
+addr-gen-mode=default
+method=disabled
+
+[proxy]

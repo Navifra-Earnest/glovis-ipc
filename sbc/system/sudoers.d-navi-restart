@@ -1,0 +1,4 @@
+# /etc/sudoers.d/navi-restart  (권한 0440, root:root)
+# 리셋 버튼(Crevis bit0)이 무인으로 실행할 수 있어야 하는 **딱 그 명령 하나**.
+# 🔴 블랭킷 sudo 를 주지 않는다 — 이 줄이 전부다.
+radxa ALL=(root) NOPASSWD: /usr/bin/systemctl restart navi
