@@ -45,7 +45,7 @@ systemctl --user daemon-reload
 echo "── 서비스 기동"
 # navi-console 은 graphical-session 에 물려 있다(창을 띄우므로).
 # 나머지 둘은 default.target — 자동로그인으로 세션이 생기면 같이 뜬다.
-systemctl --user enable --now navi-console joy-teleop crevis-io
+systemctl --user enable --now navi-console joy-teleop crevis-io joy2-teleop
 
 echo
 echo "── 경로 점검 (유선·무선 양쪽에서 전 기능이 되는지)"
@@ -55,7 +55,7 @@ python3 ./pathcheck.py --secs 3 || true
 
 echo
 echo "── 상태"
-for s in navi-console joy-teleop crevis-io; do
+for s in navi-console joy-teleop crevis-io joy2-teleop; do
     printf "   %-14s %s\n" "$s" "$(systemctl --user is-active "$s")"
 done
 echo
@@ -64,5 +64,7 @@ echo "  journalctl --user -u joy-teleop -f      # 주행 로그"
 echo "  journalctl --user -u crevis-io -f       # 물리버튼 로그"
 echo "  python3 joy_teleop.py --selftest        # 기구학·인터락 검증(HW 불필요)"
 echo "  python3 crevis_io.py --selftest         # 버튼 판정 검증"
+echo "  python3 joy2_teleop.py --selftest       # 서브 패드 판정 검증"
+echo "  python3 joy2_map.py --secs 30           # 서브 패드 버튼·축 실측"
 echo
 echo "⚠️ 리셋 버튼(navi 재시작)은 별도 준비가 필요하다 — README 의 '리셋 버튼 전제' 참고."

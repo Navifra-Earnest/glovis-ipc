@@ -85,9 +85,14 @@ def mecanum_rpm(vx, vy, wz=0.0, radius=WHEEL_RADIUS_M, max_rpm=MAX_RPM, cap=None
 
 def find_joystick():
     """터치스크린이 js0 을 잡고 있으므로 경로를 박지 말고 by-id 로 찾는다.
-    같은 장치가 `-event-joystick`(evdev, 24바이트 이벤트)로도 나오므로 반드시 제외한다."""
+    같은 장치가 `-event-joystick`(evdev, 24바이트 이벤트)로도 나오므로 반드시 제외한다.
+
+    ⚠️ 2026-09-02: 두 번째 패드(상용 아날로그, joy2-teleop 담당)가 붙었다. 그 패드를
+    X-input 모드로 바꾸면 이것도 `*-joystick` 으로 잡혀 **둘이 뒤바뀔 수 있다** →
+    이름으로 배제한다. 이 함수는 디지털 4방향 조이스틱 전용이다.
+    """
     for p in sorted(glob.glob("/dev/input/by-id/*-joystick")):
-        if "TouchController" not in p and "-event-" not in p:
+        if all(x not in p for x in ("TouchController", "-event-", "Pro_Controller")):
             return p
     raise SystemExit("조이스틱을 못 찾았다: /dev/input/by-id/*-joystick 없음")
 

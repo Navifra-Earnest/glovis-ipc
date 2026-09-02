@@ -1,0 +1,11 @@
+[Unit]
+Description=Glovis 추가 조이스틱 (상용 아날로그 패드 → navi/cmd/wheel)
+# 기존 joy-teleop 과 **독립**이다. 하나가 죽어도 다른 하나로 계속 조종할 수 있어야 한다.
+
+[Service]
+ExecStart=/usr/bin/python3 -u %h/navifra/joy2_teleop.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
