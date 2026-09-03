@@ -28,6 +28,8 @@
   python3 joy2_teleop.py --selftest          # 판정·기구학 검증 (하드웨어 불필요)
 """
 import argparse
+import array
+import fcntl
 import glob
 import json
 import math
@@ -109,19 +111,18 @@ POLL = 0.02          # 아날로그라 기존(0.05)보다 촘촘히 본다. 발�
 
 # 🔴 무선 패드가 **끊겨도 마지막 입력 상태가 그대로 남는다** — 버튼 집합과 축 값이
 #    메모리에 있으니 데드맨이 눌린 채로 굳고, 로봇은 마지막 명령으로 계속 간다.
-#    (동글을 뽑으면 read 가 죽어서 서비스가 재시작되지만, **컨트롤러만 꺼지면**
-#     노드는 살아있어서 아무 일도 안 일어난다 — 이쪽이 위험하다.)
-#    그래서 입력이 이 시간 이상 없으면 데드맨을 놓은 것으로 본다.
 #
-# 관측(2026-09-02 실주행): 이 타임아웃이 두 번 걸렸는데 **둘 다 유휴 구간**이었다
-#    (데드맨을 놓은 뒤, 또는 패드를 안 만지는 동안) → 주행을 끊지 않았다. 유휴 중에는
-#    어차피 rpm 이 0 이라 무해하다.
-# ⚠️ 다만 **스틱을 끝까지 밀어 붙인 상태**는 아직 검증 못 했다. evdev 는 값이 바뀔 때만
-#    이벤트를 주므로 32767 에 포화되면 이벤트가 끊길 수 있다(EV_SYN 도 빈 sync 는
-#    전달되지 않는 것을 로그로 확인). 그 상태로 2초가 넘으면 주행이 끊긴다.
-#    로그에 주행 중 "패드 입력 끊김" 이 뜨면 --input-timeout 을 올리거나 0 으로 끈다.
-#    오동작 방향이 **정지**라서 켠 채로 쓴다.
-INPUT_TIMEOUT = 2.0
+# ⚠️ 그런데 **"이벤트가 없다" 를 "패드가 없다" 로 보면 안 된다.** evdev 는 값이 바뀔 때만
+#    이벤트를 준다 → 스틱을 일정하게 유지하며 주행하면 아무것도 안 온다. 2초 타임아웃을
+#    걸었더니 **주행 중에 계속 멈췄다**(2026-09-03 실측: 10초 간격으로 "패드 입력 끊김"
+#    → 1초 뒤 로봇 워치독까지 트립).
+#
+# → 그래서 데드맨은 **커널에 현재 상태를 직접 묻는다**(EVIOCGKEY). 유지 중에도 정답이
+#   나오고, 패드가 빠지면 커널이 키를 해제하므로 그때만 잡힌다. 캐시된 이벤트 상태를
+#   신뢰하지 않는 것이 핵심이다.
+#
+# 타임아웃은 **긴 백스톱**으로만 남긴다(커널이 상태를 안 지우는 동글도 있을 수 있다).
+INPUT_TIMEOUT = 10.0
 DEAD = 0.12          # 정규화 데드존. 스틱 중립 드리프트가 주행으로 새는 걸 막는다
 VMAX_HW = MAX_RPM / RPM_PER_MS      # 축 상한(20 RPM)이 정하는 물리 최고속 ≈ 0.159 m/s
 
@@ -223,6 +224,27 @@ def step_limits(hat_edges, vmax, wdeg, a):
             min(a.wmax_hi, max(a.wmax_lo, round(wdeg, 2))))
 
 
+# EVIOCGKEY(len) — 커널이 들고 있는 **현재** 키 비트맵을 읽는다.
+# _IOC(_IOC_READ=2, 'E', 0x18, len) → (2<<30) | (len<<16) | ('E'<<8) | 0x18
+KEY_BYTES = (0x2FF + 8) // 8
+EVIOCGKEY = (2 << 30) | (KEY_BYTES << 16) | (ord("E") << 8) | 0x18
+
+
+def decode_keys(buf):
+    """키 비트맵 → 눌린 코드 집합. 비트 순서를 틀리면 엉뚱한 버튼을 읽는다 → selftest."""
+    return {c for c in range(len(buf) * 8) if buf[c >> 3] & (1 << (c & 7))}
+
+
+def read_keys(fd, buf=None):
+    """지금 눌려 있는 키 코드 집합. 실패하면 None (호출자가 캐시로 폴백한다)."""
+    b = buf if buf is not None else array.array("B", [0] * KEY_BYTES)
+    try:
+        fcntl.ioctl(fd, EVIOCGKEY, b)
+    except OSError:
+        return None
+    return decode_keys(b)
+
+
 class PadGone(Exception):
     """동글이 빠졌거나 노드가 사라졌다 → 재오픈이 필요하다.
 
@@ -240,6 +262,15 @@ class Pad:
     def __init__(self, path):
         self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         self.btn, self.ax, self.edges = set(), {}, []
+        self._kbuf = array.array("B", [0] * KEY_BYTES)
+
+    def keys_now(self):
+        """커널이 보는 **현재** 버튼 상태. None 이면 조회 실패 → 캐시를 쓴다.
+
+        이벤트 캐시(self.btn)와 달리 스틱을 유지해도 정확하고, 패드가 빠지면
+        커널이 키를 해제하므로 그것도 여기서 드러난다.
+        """
+        return read_keys(self.fd, self._kbuf)
 
     def poll(self):
         """읽을 게 없을 때까지 비운다. **읽은 이벤트 수**를 돌려준다(입력 끊김 감시용).
@@ -393,13 +424,21 @@ def main():
                     print("\n[입력] 패드 복구", flush=True)
             elif a.input_timeout and not stale and now - last_input > a.input_timeout:
                 stale = True
-                print(f"\n⚠ [입력] 패드에서 {a.input_timeout:.1f}초간 아무것도 안 온다 — "
-                      f"정지한다 (컨트롤러 전원·배터리 확인)", flush=True)
+                print(f"\n⚠ [입력] 패드에서 {a.input_timeout:.1f}초간 이벤트가 없다 — "
+                      f"정지한다. 커널이 보는 키={sorted(pad.keys_now() or [])} "
+                      f"(비어 있으면 패드가 빠진 것, 눌려 있으면 유지 중인 것)", flush=True)
             if pad.edges:
                 vmax, wdeg = step_limits(pad.edges, vmax, wdeg, a)
                 print(f"\n[속도] 주행 {vmax:.3f} m/s · 회전 {wdeg:.1f}°/s", flush=True)
 
-            vx, vy, wz = resolve(pad.btn, pad.ax, vmax,
+            # 🔴 데드맨은 **커널 현재 상태**로 본다 (이벤트 캐시가 아니라).
+            #    조회가 실패하면 캐시로 폴백한다 — 조회 실패로 조종을 잃는 게 더 나쁘다.
+            live = pad.keys_now()
+            if live is None:
+                btn = pad.btn           # 조회 실패 → 이벤트 캐시로 폴백
+            else:
+                pad.btn = btn = live    # 커널 진실로 맞춘다 (엣지 유실도 함께 보정된다)
+            vx, vy, wz = resolve(btn, pad.ax, vmax,
                                  math.radians(wdeg) * ROT_ARM_M)
             if stale or not allowed(st.get("enabled")):
                 vx = vy = wz = 0.0            # 손을 뗀 것과 동일 취급
@@ -408,9 +447,9 @@ def main():
                 cli.publish(a.prefix + "/cmd/wheel",
                             json.dumps({"rpm": rpm, "ramp": RAMP}), qos=1)
                 moving, last_pub = True, now
-                mode = "횡이동" if pad.btn & set(BTN_STRAFE) else "주행  "
+                mode = "횡이동" if btn & set(BTN_STRAFE) else "주행  "
                 status(f"[{mode}] vx={vx:+.3f} vy={vy:+.3f} wz={wz:+.3f} rpm={rpm}"
-                       f"  btn={sorted(pad.btn)}")
+                       f"  btn={sorted(btn)}")
             elif not any(rpm) and moving:
                 # rpm=[0,0,0,0] 은 절대 보내지 않는다 — 여자 유지로 과전류 e-stop 위험
                 cli.publish(a.prefix + "/cmd/stop", "{}", qos=1)
@@ -421,7 +460,7 @@ def main():
                        else "대기 — 구동허용 상태 수신 전"
                        if st.get("enabled") is None
                        else "정지 (데드맨 해제)"
-                       if not all(b in pad.btn for b in BTN_DEADMAN) else "정지")
+                       if not all(b in btn for b in BTN_DEADMAN) else "정지")
                 status(why, force=True)
             # ── 유령 구동 감시: 내가 활성 조종기이고 명령을 안 보내는 중인데 모터가 돈다 ──
             #    (활성일 때만 본다 — 기존 조이스틱이 주행 중일 때 정지를 쏘면 안 된다)
@@ -563,6 +602,21 @@ def selftest():
     # ── 유령 감시는 활성 조종기만 — 아니면 서로를 죽인다 ──
     assert ghost((0.0, 0.0, -0.4, 0.0), 5.0)          # 판정 자체는 joy_teleop 에서 검증
     assert allowed(True) is False, "허용 ON 이면 유령 감시도 돌지 않아야 한다"
+
+    # ── 키 비트맵 디코딩 (EVIOCGKEY) — 비트 순서를 틀리면 엉뚱한 버튼을 읽는다 ──
+    buf = bytearray(KEY_BYTES)
+    assert decode_keys(buf) == set()
+    for code in (0, 7, 8, 310, 311, 307):        # LSB·바이트 경계·데드맨·X
+        b = bytearray(KEY_BYTES)
+        b[code >> 3] |= 1 << (code & 7)
+        assert decode_keys(b) == {code}, code
+    b = bytearray(KEY_BYTES)
+    for code in BTN_DEADMAN:
+        b[code >> 3] |= 1 << (code & 7)
+    assert decode_keys(b) == set(BTN_DEADMAN)
+    # ioctl 번호가 틀리면 조회가 통째로 실패한다 → 방향·크기 비트를 고정 검증
+    assert EVIOCGKEY == (2 << 30) | (KEY_BYTES << 16) | (0x45 << 8) | 0x18
+    assert KEY_BYTES == 96, "KEY_MAX(0x2FF) 기준 96바이트"
 
     # ── 조종기 선택: 허용 OFF 에서만 활성, **모르는 상태는 막힌다** ──
     assert allowed(False) is True, "허용 OFF = 서브 패드 차례"
