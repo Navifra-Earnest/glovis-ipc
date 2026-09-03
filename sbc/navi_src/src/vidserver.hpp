@@ -28,6 +28,8 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -126,35 +128,71 @@ private:
         }
     }
 
-    // 논블로킹 전송. 다 못 보내면 그 프레임은 버린다 — 밀린 영상을 뒤늦게 보내면
-    // 지연만 쌓이고, 어차피 다음 프레임이 온다.
-    bool sendAll(int fd, const uint8_t* p, size_t n) {
+    // 소켓에 아직 안 빠진 바이트. 이걸로 **보내기 전에** 밀렸는지 판단한다.
+    static size_t outQueue(int fd) {
+        int q = 0;
+        return (::ioctl(fd, SIOCOUTQ, &q) == 0 && q > 0) ? static_cast<size_t>(q) : 0;
+    }
+
+    // 전송 결과. **끊김과 밀림을 구분한다** — 예전엔 둘 다 false 로 뭉개서
+    // 잠깐 밀린 것만으로 클라이언트를 끊었다.
+    enum class Send { Ok, Backlog, Dead };
+
+    // 논블로킹 전송. 한 번 시작한 프레임은 끝까지 보낸다 — 중간에 포기하면
+    // 스트림이 깨져서 어차피 재동기가 필요하다.
+    Send sendAll(int fd, const uint8_t* p, size_t n) {
         size_t off = 0;
         int spins = 0;
         while (off < n) {
             const auto w = ::send(fd, p + off, n - off, MSG_NOSIGNAL);
-            if (w > 0) { off += static_cast<size_t>(w); continue; }
+            if (w > 0) { off += static_cast<size_t>(w); spins = 0; continue; }
             if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (++spins > 200) return false;      // 20ms 넘게 안 빠지면 포기
+                // 🔴 예전엔 20ms(200 spin)에서 포기하고 **연결을 끊었다.** 무선에서
+                //    재전송 폭풍으로 수십~수백 ms 막히는 건 흔한 일이라, 그때마다
+                //    끊기고 → IPC 가 재접속 → 키프레임 대기로 검은 화면이 길어지는
+                //    루프가 돌았다(실측 2026-09-03: 15분에 파이프라인 재시작 60회,
+                //    그 사이 로봇은 정상적으로 20.3 fps 를 보내고 있었다).
+                //    이제 넉넉히 기다리고, 그래도 안 되면 **연결은 살린 채 재동기**한다.
+                if (++spins > 3000) return Send::Backlog;      // 300ms
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
                 continue;
             }
-            return false;                              // 끊겼다
+            return Send::Dead;                          // 진짜 끊겼다 (EPIPE 등)
         }
-        return true;
+        return Send::Ok;
     }
 
     void broadcast(const std::vector<uint8_t>& pkt, bool key) {
         for (size_t i = 0; i < clients_.size();) {
-            bool ok = true;
+            // 🔴 **보내기 전에** 밀렸는지 본다. 이미 소켓에 한 프레임 넘게 쌓여 있으면
+            //    이 프레임은 시작조차 하지 않는다 — 중간에 포기하면 스트림이 깨진다.
+            //    지연을 쌓는 대신 프레임을 버리는 게 저지연 영상의 정석이다.
+            //    (키프레임도 예외가 아니다. 다음 키프레임에 다시 붙으면 된다)
+            if (outQueue(clients_[i]) > kMaxOutQ) {
+                std::lock_guard<std::mutex> lk(mu_);
+                ++st_.dropped;
+                ++i;
+                continue;
+            }
+            Send r = Send::Ok;
             if (pending_hdr_[i]) {
                 // 키프레임부터 시작해야 그림이 나온다. 그 전까지는 헤더만 들고 기다린다.
                 if (!key) { ++i; continue; }
-                ok = sendAll(clients_[i], enc_->header().data(), enc_->header().size());
-                if (ok) pending_hdr_[i] = false;
+                r = sendAll(clients_[i], enc_->header().data(), enc_->header().size());
+                if (r == Send::Ok) pending_hdr_[i] = false;
             }
-            if (ok) ok = sendAll(clients_[i], pkt.data(), pkt.size());
-            if (!ok) {
+            if (r == Send::Ok) r = sendAll(clients_[i], pkt.data(), pkt.size());
+            if (r == Send::Backlog) {
+                // 프레임을 중간까지 보내고 못 끝냈다 → 스트림이 깨졌다.
+                // **연결은 살리고** 헤더+다음 키프레임으로 재동기한다. 끊으면 IPC 가
+                // 재접속하며 더 오래 검은 화면이 된다.
+                pending_hdr_[i] = true;
+                std::lock_guard<std::mutex> lk(mu_);
+                ++st_.dropped;
+                ++i;
+                continue;
+            }
+            if (r == Send::Dead) {
                 ::close(clients_[i]);
                 clients_.erase(clients_.begin() + i);
                 pending_hdr_.erase(pending_hdr_.begin() + i);
@@ -236,6 +274,10 @@ private:
 
     Config::Video cfg_;
     CamStream* cam_ = nullptr;
+    // 소켓에 이만큼 넘게 쌓여 있으면 새 프레임을 시작하지 않는다.
+    // 1.2Mbps/20fps 면 프레임 평균 ~7.5KB → 64KB 는 약 0.4초분이다.
+    static constexpr size_t kMaxOutQ = 64 * 1024;
+
     std::unique_ptr<H264Enc> enc_;
     // Clock 별칭은 루프 함수 안에 있으므로 멤버에는 정규 타입을 쓴다
     std::chrono::steady_clock::time_point next_enc_{};   // 0 = 아직 한 장도 안 보냄

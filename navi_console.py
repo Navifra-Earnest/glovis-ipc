@@ -17,7 +17,18 @@ import mqtt_link
 PORT, PREFIX = 1883, "navi"
 VIDEO_PORT = 5000
 RECONNECT_S = 2          # 영상 파이프라인 오류 후 재시도 간격
-VIDEO_STALL_S = 4        # 이 시간 동안 프레임이 없으면 파이프라인을 다시 세운다
+# 이 시간 동안 프레임이 없으면 파이프라인을 다시 세운다.
+#
+# 🔴 4 → 12 (2026-09-03). 4초는 **무선에서 너무 짧다.** 재전송 폭풍으로 몇 초 멈추는
+#    건 흔한데, 그때마다 파이프라인을 재시작하면 재접속 + **키프레임 대기**로 검은
+#    화면이 더 길어진다. 실측: 15분에 **재시작 60회**(15초마다), 그 사이 로봇은
+#    정상적으로 20.3 fps 를 보내고 있었다(frames 가 계속 증가, dropped 는 고정).
+#    **복구 장치가 증상을 키우고 있었다.**
+#
+#    이 워치독이 진짜로 잡아야 하는 것은 **좀비 TCP**(4.11) — 그건 영영 복구되지
+#    않으므로 12초를 기다려도 손해가 없다. 반면 일시적 무선 멈춤은 기다리면 저절로
+#    돌아온다. **"영영 죽은 것" 과 "잠깐 막힌 것" 을 구분해야 하고, 구분 기준은 시간이다.**
+VIDEO_STALL_S = 12
 
 # ── 차폭 예측선 (1920x1080 프레임 좌표) ───────────────────────────────
 # 2026-08-18 사용자가 바닥 실측해서 그은 선을 픽셀에서 추출한 값이다.
@@ -407,6 +418,8 @@ def main():
     #
     # 그래서 10 으로 되돌렸다(사용자 요청): 열화상은 카메라가 ~8 fps 라 이미 느려서
     # 더 낮추면 안 보인다. 대역이 필요하면 **영상(video_bps/video_fps)** 을 먼저 줄인다.
+    ap.add_argument("--video-stall", type=float, default=VIDEO_STALL_S,
+                    help="이 시간 프레임이 없으면 파이프라인 재시작 (짧으면 무선에서 오작동)")
     ap.add_argument("--thermal-fps", type=int, default=10,
                     help="열화상 PiP fps. 카메라가 ~8fps 라 그 이상은 의미 없다")
     ap.add_argument("--notice-secs", type=float, default=8.0,
@@ -521,7 +534,7 @@ def main():
             request_video_restart()
         return True
 
-    GLib.timeout_add_seconds(VIDEO_STALL_S, video_watchdog)
+    GLib.timeout_add_seconds(max(1, int(a.video_stall)), video_watchdog)
 
     # ---------- 화면 ----------
     win = Gtk.Window(title="Glovis 화재진압로봇")
