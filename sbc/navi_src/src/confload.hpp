@@ -138,6 +138,15 @@ inline ConfLoad loadConf(Config& cfg, const char* explicit_path = nullptr) {
             r.applied.push_back(k);
         }
         // de_line 과 같은 이유로 strtoul 이다 — inum 은 int& 를 받는데 line 은 unsigned 다
+        // 🔴 매뉴얼 표 4-2 에는 있는데 **파싱이 없었다**(2026-09-03 추가).
+        //    무선 거리가 멀어지면 여기를 낮춰서 끊김을 줄인다.
+        else if (k == "video_bps")        inum(cfg.video.bps);
+        else if (k == "video_fps")        inum(cfg.video.fps);
+        else if (k == "video_port")       inum(cfg.video.port);
+        else if (k == "video_enabled") {
+            cfg.video.enabled = (v != "0" && v != "false");
+            r.applied.push_back(k);
+        }
         else if (k == "led_line")         { unsigned u = std::strtoul(v.c_str(), nullptr, 10);
                                             cfg.led.line = u; r.applied.push_back(k); }
         else if (k == "led_on_boot") {

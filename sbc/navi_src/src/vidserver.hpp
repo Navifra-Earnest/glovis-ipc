@@ -169,6 +169,23 @@ private:
                 continue;
             }
 
+            // 🔴 **프레임 감축.** 없으면 카메라 속도(실측 61fps)로 그대로 인코딩되는데,
+            //    MPP 에는 `rc:fps_in_num = cfg_.fps`(30)로 알려주므로 CBR 이 프레임당
+            //    예산을 30fps 기준으로 잡는다 → **출력이 정확히 2배**가 된다.
+            //    실측 2026-08-18: 목표 2Mbps 인데 스트림이 3.9~4.0Mbps.
+            //    (config.hpp 주석에 "카메라가 60이어도 30으로 줄여 보낸다" 고
+            //     의도가 적혀 있었지만 구현이 없었다 — 2026-09-03 확인)
+            //    덤으로 VPU·CPU 부하와 네트워크 패킷 수도 절반이 된다.
+            if (cfg_.fps > 0) {
+                const auto now = Clock::now();
+                const auto period = std::chrono::microseconds(1'000'000 / cfg_.fps);
+                // 첫 프레임은 그냥 보낸다. 이후는 주기를 지킨다.
+                // 여유 10% 를 빼는 이유: 카메라 주기와 인코딩 주기가 딱 안 맞으면
+                // 매번 "아직 이르다" 로 밀려 실효 fps 가 절반으로 떨어진다.
+                if (next_enc_.time_since_epoch().count() != 0 && now < next_enc_) continue;
+                next_enc_ = now + period - period / 10;
+            }
+
             // 첫 프레임에서 실제 해상도를 보고 인코더를 만든다 — 설정과 카메라가
             // 다를 수 있으므로 카메라가 주는 값을 따른다.
             if (!enc_) {
@@ -202,6 +219,8 @@ private:
     Config::Video cfg_;
     CamStream* cam_ = nullptr;
     std::unique_ptr<H264Enc> enc_;
+    // Clock 별칭은 루프 함수 안에 있으므로 멤버에는 정규 타입을 쓴다
+    std::chrono::steady_clock::time_point next_enc_{};   // 0 = 아직 한 장도 안 보냄
     int listen_fd_ = -1;
     std::vector<int> clients_;
     std::vector<bool> pending_hdr_;
