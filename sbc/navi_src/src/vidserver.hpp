@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -101,6 +102,23 @@ private:
             ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
             int on = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);   // 지연을 줄인다
+
+            // 🔴 영상을 **배경 트래픽(AC_BK)** 으로 표시한다.
+            //
+            //    Wi-Fi 는 IP DSCP 로 WMM 큐를 고른다(cfg80211_classify8021d).
+            //    CS1(DSCP 8, TOS 0x20) → AC_BK. 표시하지 않으면 영상이 구동 명령과
+            //    같은 AC_BE 큐를 다투고, 실측에서 명령 RTT 가 이렇게 벌어졌다
+            //    (2026-09-03, 같은 자리):
+            //        영상 ON  → 평균 75.8 ms · 최대 575 ms
+            //        영상 OFF → 평균 10.4 ms · 최대 144 ms
+            //    신호가 -64 dBm 로 떨어지면 ON 에서 평균 606 ms · 최대 1680 ms 까지 갔다
+            //    → 로봇 워치독(800 ms)이 주행 중에 트립한다.
+            //
+            //    영상은 몇십 ms 늦어도 사람 눈엔 안 보이지만, 구동 명령이 늦으면
+            //    로봇이 선다. **우선순위를 뒤집는 게 맞다.**
+            const int tos = 0x20;   // CS1 = 배경
+            // 실패해도 영상은 계속 보낸다 — 우선순위는 최적화지 필수 기능이 아니다
+            (void)::setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
             clients_.push_back(fd);
             pending_hdr_.push_back(true);             // SPS/PPS 를 먼저 보내야 한다
             std::lock_guard<std::mutex> lk(mu_);
