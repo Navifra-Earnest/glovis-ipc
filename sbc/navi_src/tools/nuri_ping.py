@@ -83,6 +83,12 @@ class Bus:
         #   TIOCOUTQ=0은 FIFO로 넘어간 시점일 뿐 → 너무 일러서 송신이 잘림
         # 그래서 둘 다 쓰지 않고 전송 시작 시각 + 이론 전송시간으로 직접 계산한다.
         self.guard = guard_us / 1e6
+        # USB-RS485 동글(CH340 등)은 **방향전환이 하드웨어 자동**이다. DE GPIO 를 잡으면
+        # 안 되고(그 핀은 HAT 의 트랜시버용이다) 잡을 필요도 없다 → --no-de 로 끈다.
+        if DE_LINE is None or DE_LINE < 0:
+            self.line = None
+            self.mode = "DE 없음 (동글 자동 방향전환)"
+            return
         chip = gpiod.Chip(DE_CHIP)
         self.line = chip.get_line(DE_LINE)
         self.line.request(consumer="nuri", type=gpiod.LINE_REQ_DIR_OUT, default_vals=[0])
@@ -91,6 +97,14 @@ class Bus:
     def send(self, pkt):
         """DE를 올려 송신하고, 전송이 끝나는 시점에 맞춰 정확히 내린다."""
         self.ser.reset_input_buffer()
+        if self.line is None:
+            # 자동 방향전환 동글: 쓰고 나서 전송이 끝날 때까지만 기다린다. 이 대기를
+            # 빼면 다음 flushInput 이 응답 앞부분을 지운다(수신 시작이 더 빠르다).
+            t0 = time.perf_counter()
+            self.ser.write(pkt)
+            while time.perf_counter() < t0 + len(pkt) * 10 / self.baud:
+                pass
+            return
         self.line.set_value(1)                      # DE=H → 송신
         t0 = time.perf_counter()
         self.ser.write(pkt)
@@ -132,8 +146,9 @@ class Bus:
         return None, ("무응답" if not buf else f"불완전 raw={bytes(buf).hex(' ')}")
 
     def close(self):
-        self.line.set_value(0)
-        self.line.release()
+        if self.line is not None:
+            self.line.set_value(0)
+            self.line.release()
         self.ser.close()
 
 
@@ -419,6 +434,8 @@ def main():
                     help=f"RS485_DE 의 gpiochip (기본: 자동탐지 = {DE_CHIP})")
     ap.add_argument("--de-line", type=int, default=None,
                     help=f"RS485_DE 의 line (기본: 자동탐지 = {DE_LINE})")
+    ap.add_argument("--no-de", action="store_true",
+                    help="DE GPIO 를 쓰지 않는다 — USB-RS485 동글(방향전환 자동)용")
     ap.add_argument("--set-ratio", type=float, metavar="N",
                     help="외부 감속비를 N:1 로 설정 (EEPROM 기록). 예: --set-ratio 16")
     ap.add_argument("--set-baud", type=int, metavar="BPS",
@@ -431,7 +448,9 @@ def main():
 
     if a.de_chip: DE_CHIP = a.de_chip
     if a.de_line is not None: DE_LINE = a.de_line
-    print(f"DE: {DE_CHIP}:{DE_LINE}")
+    if a.no_de: DE_LINE = -1
+    print(f"포트: {a.port}   DE: " + ("없음 (동글 자동)" if DE_LINE < 0
+                                      else f"{DE_CHIP}:{DE_LINE}"))
 
     if a.de_sweep:
         de_sweep(a.port, a.baud, a.id)

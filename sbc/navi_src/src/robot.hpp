@@ -243,7 +243,12 @@ public:
                     drive_->failedAxis(), drive_->overcurrentAmp(), cfg_.overcurrent_a);
                 estop(buf);
             } else {
-                estop(std::string("휠 ") + drive_->failedAxis() + " 응답 없음 — 전 축 정지");
+                // tick() 은 한 번에 한 축만 본다 → 이 순간 죽은 걸로 표시된 축은 하나뿐이다.
+                // 데이지체인이라 실제로는 여러 축이 같이 사라지는 게 보통이므로,
+                // 세운 뒤 나머지 축도 한 번 찍어서 **무응답 목록 전체**를 알린다.
+                // (이미 stop() 이 걸렸고 e-stop 으로 래치되므로 여기서 400ms 는 괜찮다)
+                drive_->pollAll();
+                estop("무응답 휠 " + drive_->deadAxes() + " — 전 축 정지");
             }
         }
 

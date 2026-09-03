@@ -109,6 +109,12 @@ public:
         if (fd_ < 0) throw std::runtime_error("포트 열기 실패: " + port);
         configure(baud);
 
+        // `de_chip = none` → DE GPIO 를 쓰지 않는다. USB-RS485 동글(CH340 등)은
+        // **방향전환이 하드웨어 자동**이라 DE 핀이 없고, HAT 의 DE 핀(gpiochip4:1)을
+        // 잡아봐야 동글과 무관한 트랜시버를 흔들 뿐이다.
+        // (2026-09-03 HAT 의 RS485 가 죽어 동글로 우회할 때 넣었다)
+        if (!de_chip || !*de_chip || std::string(de_chip) == "none") return;
+
         chip_ = gpiod_chip_open_by_name(de_chip);
         if (!chip_) { ::close(fd_); throw std::runtime_error("gpiod_chip_open 실패"); }
         de_ = gpiod_chip_get_line(chip_, de_line);
@@ -140,13 +146,15 @@ public:
         if (since < kMinGap) std::this_thread::sleep_for(kMinGap - since);
 
         flushInput();
-        gpiod_line_set_value(de_, 1);
+        if (de_) gpiod_line_set_value(de_, 1);
         const auto t0 = Clock::now();
         ::write(fd_, pkt.data(), pkt.size());
+        // DE 없는 동글이면 guard 는 의미가 없다 — 방향전환을 동글이 알아서 한다.
+        // 다만 전송이 끝날 때까지는 기다려야 한다(다음 flushInput 이 응답을 지운다).
         const auto end = t0 + std::chrono::duration_cast<Clock::duration>(
-            std::chrono::duration<double>(pkt.size() * 10.0 / baud_ + guard_));
+            std::chrono::duration<double>(pkt.size() * 10.0 / baud_ + (de_ ? guard_ : 0.0)));
         while (Clock::now() < end) {}          // busy-wait: sleep은 이 정밀도가 안 나온다
-        gpiod_line_set_value(de_, 0);
+        if (de_) gpiod_line_set_value(de_, 0);
         last_tx_ = Clock::now();
     }
 

@@ -88,17 +88,31 @@ public:
     // (한 바퀴만 도는 4륜차는 위험하다).
     Drive(const Config& cfg, nuri::Bus& bus) : cfg_(cfg) {
         motors_.reserve(cfg_.wheels.size());
+        // 🔴 첫 실패에서 던지지 않는다 — 모터는 RS485 **데이지체인**이라 한 노드의
+        //    접촉이 나가면 그 뒤가 통째로 사라진다. "FL 초기화 실패" 한 줄만 보면
+        //    배선을 어디서 짚어야 하는지 알 수 없다. **무응답 축 전부**를 모아서
+        //    한 번에 알린다. (2026-09-03: ID 3 접촉 불량이 4축 침묵으로 나타났다)
+        std::string dead, live;
+        int n_dead = 0;
         for (size_t i = 0; i < cfg_.wheels.size(); ++i) {
             const auto& w = cfg_.wheels[i];
-            try {
-                motors_.emplace_back(bus, w.id, cfg_.gear_ratio);
-            } catch (const std::exception& e) {
-                throw std::runtime_error(std::string("휠 ") + w.label + " (ID "
-                                         + std::to_string(w.id) + ") 초기화 실패: " + e.what());
-            }
             state_[i].id = w.id;
             state_[i].label = w.label;
+            try {
+                motors_.emplace_back(bus, w.id, cfg_.gear_ratio);
+                append(live, w.label, w.id);
+            } catch (const std::exception&) {
+                append(dead, w.label, w.id);
+                ++n_dead;
+            }
         }
+        // 실패가 있으면 **반드시** 던진다 — 위에서 실패를 건너뛰었으므로 motors_ 와
+        // cfg_.wheels 의 색인이 어긋나 있다. 이 객체를 계속 쓰면 안 된다.
+        if (n_dead)
+            throw std::runtime_error(
+                "무응답 휠 " + std::to_string(n_dead) + "/"
+                + std::to_string(cfg_.wheels.size()) + ": " + dead
+                + (live.empty() ? " (정상 없음 — 버스/전원부터 확인)" : "  |  정상: " + live));
     }
 
     // ── ① 축별 속도 — 차체 치수 없이도 쓸 수 있다 ──────────────
@@ -308,8 +322,18 @@ public:
         return ok;
     }
 
-    // 마지막으로 실패 판정된 축 라벨 (e-stop 사유에 쓴다)
+    // 마지막으로 실패 판정된 축 라벨 (과전류 사유에 쓴다 — 과전류는 축 하나가 원인이다)
     const char* failedAxis() const { return failed_; }
+
+    // 지금 응답이 없는 축 **전부**. tick() 은 한 번에 한 축만 보므로 failed_ 에는
+    // 마지막 하나만 남는다. 데이지체인에서 여러 축이 동시에 죽는 게 정상적인 고장
+    // 양상이라, 사람이 배선을 짚으려면 목록이 필요하다. pollAll() 뒤에 부를 것.
+    std::string deadAxes() const {
+        std::string dead;
+        for (size_t i = 0; i < motors_.size(); ++i)
+            if (!state_[i].alive) append(dead, state_[i].label, state_[i].id);
+        return dead.empty() ? failed_ : dead;   // 아직 판정 전이면 마지막 실패축이라도 낸다
+    }
 
     // tick() 이 false 를 낸 이유가 과전류인지 (아니면 응답 없음인지)
     bool overcurrent() const { return overcurrent_; }
@@ -371,6 +395,12 @@ private:
     // 단계 간격. poll() 의 안정화 구간(250ms)보다 길어야 실측이 갱신된다.
     static constexpr auto kDecelStep = std::chrono::milliseconds(300);
     const char* failed_ = "";
+
+    // "FL(ID 1) · RL(ID 3)" 로 이어 붙인다. 초기화·런타임 두 곳에서 같은 형식을 쓴다.
+    static void append(std::string& out, const char* label, uint8_t id) {
+        if (!out.empty()) out += " · ";
+        out += std::string(label) + "(ID " + std::to_string(id) + ")";
+    }
     nuri::Clock::time_point cmd_at_{};
 };
 
