@@ -129,6 +129,7 @@ MQTT 브로커는 **로봇에** 있다(`listener 1883 0.0.0.0`, 익명). IPC 가
 | IO 버튼 bit1 / bit2 | 리프트 UP / DOWN (**상승은 도달 시 자동 차단** — 아래) |
 | IO 버튼 bit0 | **① IPC UI(`navi-console`) 재시작 + ② 로봇 `navi` 재시작** (쿨다운 15초) |
 | 콘솔 RESET 버튼 | `cmd/reset` — e-stop 래치 즉시 해제 **+ 차량 카운터 0** |
+| 작업등 (12V LED×3) | **상시 점등** (`led_on_boot=1`). 필요하면 `cmd/led {"on":false}` |
 
 ### 리프트 상승 자동 차단 (차체에 닿으면 그만 올린다)
 

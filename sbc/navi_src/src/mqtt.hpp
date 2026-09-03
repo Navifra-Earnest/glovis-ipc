@@ -32,7 +32,8 @@ using Json = nlohmann::json;
 
 // ── 상위에서 오는 명령 ─────────────────────────────────────────────
 struct Command {
-    enum class Kind { Wheel, Body, Actuator, Stop, Estop, Reset, ThermalFFC, Stream, Unknown };
+    enum class Kind { Wheel, Body, Actuator, Led, Stop, Estop, Reset, ThermalFFC, Stream,
+                      Unknown };
     Kind kind = Kind::Unknown;
 
     WheelRpm wheel{};          // Kind::Wheel
@@ -40,6 +41,7 @@ struct Command {
     int  stream_fps = 0;       // 0 이면 설정값 유지
     BodyVel body{};            // Kind::Body
     double ramp = 0.5;
+    bool led_on = false;       // Kind::Led
     bool actuator_ret = false; // Kind::Actuator
     double actuator_duty = -1.0;
     std::string reason;        // Kind::Estop
@@ -162,7 +164,7 @@ private:
         me->connected_ = true;
         me->last_error_.clear();
         // 재연결 때마다 다시 구독해야 한다 (세션을 clean으로 잡았으므로)
-        for (const char* s : {"cmd/wheel", "cmd/body", "cmd/actuator",
+        for (const char* s : {"cmd/wheel", "cmd/body", "cmd/actuator", "cmd/led",
                               "cmd/stop", "cmd/estop", "cmd/reset", "cmd/thermal/ffc", "cmd/stream"})
             mosquitto_subscribe(mo, nullptr, me->topic(s).c_str(), me->m_.qos_cmd);
         const std::string on = R"({"online":true})";
@@ -247,6 +249,12 @@ private:
             c.ramp = j.value("ramp", 0.5);
             return c;
         }
+        if (sub == "cmd/led") {
+            // {"on":true|false}. 유지 발행이 필요 없다 — 워치독 대상이 아니다.
+            c.kind = Command::Kind::Led;
+            c.led_on = j.value("on", false);
+            return c;
+        }
         if (sub == "cmd/actuator") {
             // {"dir":"ext"|"ret", "duty":30}
             c.kind = Command::Kind::Actuator;
@@ -299,6 +307,7 @@ inline std::string stateDigest(const RobotStatus& s) {
         d += std::to_string(static_cast<int>(std::lround(w.rpm)));   // 정수 RPM 만
         d += w.alive ? 'a' : 'x';
     }
+    d += s.led_on ? 'L' : '-';
     d += '|';
     d += std::to_string(static_cast<int>(s.actuator_state));
     d += std::to_string(s.actuator_position);
@@ -347,6 +356,9 @@ inline std::string toJson(const RobotStatus& s) {
         j["actuator"]["position"] = s.actuator_position;
         j["actuator"]["current"] = r2(s.actuator_current);
     }
+
+    j["led"]["present"] = s.led_present;
+    if (s.led_present) j["led"]["on"] = s.led_on;
 
     j["tof"]["present"] = s.tof_present;
     if (s.tof_present) {

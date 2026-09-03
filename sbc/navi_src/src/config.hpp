@@ -98,6 +98,18 @@ struct Config {
     // ── 열화상 (ThermoEye TMC80, TmSDK 사용) ─────────────────────
     // UVC로 직접 열면 프레임이 안 나온다 — SDK가 CDC 제어까지 함께 해줘야 스트림이 켜진다.
     // 그래서 uvccam.hpp 가 아니라 thermal.hpp 로 따로 다룬다.
+    // 작업등(12V LED ×3). HAT 의 Q3 를 GPIO 한 줄로 스위칭한다 — **3채널 일괄**이다.
+    // 핀은 40핀 16번 = gpiochip1:5 (2026-09-03 실측). 보드가 바뀌면 다시 재야 한다.
+    struct Led {
+        bool enabled = true;
+        const char* chip = "gpiochip1";
+        unsigned line = 5;
+        // 기동과 함께 켤지. 기본은 **꺼짐**이다 — 설계원칙 ③(기본값이 안전).
+        // 상시 점등이 필요하면 navi.conf 에서 `led_on_boot = 1` 로 **명시**한다.
+        // 그래야 "왜 켜져 있나" 를 설정 파일에서 찾을 수 있다.
+        bool on_boot = false;
+    } led;
+
     struct Thermal {
         bool enabled = true;
         int width = 80, height = 60;

@@ -24,6 +24,7 @@
 #include "config.hpp"
 #include "drive.hpp"
 #include "hall.hpp"       // HallCounter — actuator.hpp를 함께 끌어온다
+#include "led.hpp"        // 작업등 — 구동계·워치독과 무관하다
 #include "nurirobot.hpp"
 #include "tof.hpp"
 #include "vidserver.hpp"
@@ -44,6 +45,9 @@ struct RobotStatus {
     int wheels_alive = 0;
     BodyVel body{};                 // 운동학 준비됐을 때만 채운다
     bool kinematics = false;
+
+    bool led_present = false;
+    bool led_on = false;
 
     bool actuator_present = false;
     State actuator_state = State::Idle;
@@ -121,6 +125,18 @@ public:
             }
         }
 
+        // ── 작업등 ──
+        // 초기화가 실패해도 **기동은 계속한다** (설계원칙 ①). LED 명령만 거부된다.
+        if (cfg_.led.enabled) {
+            try {
+                led_ = std::make_unique<Led>(cfg_.led.chip, cfg_.led.line);
+                if (cfg_.led.on_boot) led_->set(true);   // 상시 점등 (navi.conf)
+            } catch (const std::exception& e) {
+                led_err_ = e.what();
+                led_.reset();
+            }
+        }
+
         // ── ToF ──
         if (cfg_.tof.enabled) tof_ = std::make_unique<TofStream>(cfg_.tof);
 
@@ -192,6 +208,20 @@ public:
         cmd_at_ = nuri::Clock::now();
     }
     void actuatorStop() { if (act_) act_->stop(); }
+
+    // 작업등 — 없으면 조용히 무시한다.
+    //
+    // 🔴 accept()·acceptCommon() 을 **쓰지 않고 cmd_at_ 도 건드리지 않는다.**
+    //    · e-stop 중에도 켜져야 한다 (멈춘 뒤에도 상황을 봐야 한다) → 게이트 없음
+    //    · 워치독 대상이 아니다 → cmd_at_ 을 갱신하면 작업등이 구동 워치독의
+    //      keepalive 가 되어 "명령이 끊기면 정지" 가 깨진다. 절대 넣지 말 것.
+    void setLed(bool on) {
+        if (!led_) return;
+        led_->set(on);
+    }
+    bool ledOn() const { return led_ && led_->on(); }
+    bool ledPresent() const { return static_cast<bool>(led_); }
+    const std::string& ledError() const { return led_err_; }
     Actuator* actuator() { return act_.get(); }
 
     // ── 주기 갱신 ──────────────────────────────────────────────
@@ -316,6 +346,8 @@ public:
             s.thermal_status = thermal_->status();
         }
         s.estopped = estopped_;
+        s.led_present = static_cast<bool>(led_);
+        s.led_on = ledOn();
         s.watchdog_tripped = watchdog_tripped_;
         s.estop_reason = estop_reason_;
         s.tick_ms = tick_ms_;
@@ -365,6 +397,8 @@ private:
     std::unique_ptr<TofStream> tof_;
     std::string drive_err_;   // 구동계 초기화 실패 사유 (비어 있으면 정상)
     std::unique_ptr<Drive> drive_;
+    std::unique_ptr<Led> led_;
+    std::string led_err_;   // 작업등 초기화 실패 사유 (비어 있으면 정상)
     std::unique_ptr<Actuator> act_;
     std::unique_ptr<HallCounter> hall_;
     std::vector<std::unique_ptr<CamStream>> cams_;

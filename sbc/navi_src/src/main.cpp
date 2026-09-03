@@ -98,6 +98,13 @@ void banner(navi::Robot& robot) {
             std::printf("     ↳ sysfs 권한 문제로 보인다 — sudo 로 실행할 것\n");
     }
 
+    // 작업등 — 매뉴얼 §5 배너 형식과 같게 둔다
+    if (robot.ledPresent())
+        std::printf("── 작업등: 정상 (%s:%u, 현재 %s)\n",
+                    cfg.led.chip, cfg.led.line, robot.ledOn() ? "켜짐" : "꺼짐");
+    else if (cfg.led.enabled)
+        std::printf("── 작업등: 없음 — %s\n", robot.ledError().c_str());
+
     // 9600bps에서는 축당 왕복이 ~15ms라 4축이면 주기를 못 맞춘다 (실측 1축에 23.6ms).
     if (cfg.rs485_baud < 115200)
         std::printf("── ⚠ RS485 %d bps: 축당 폴링이 느려 tick 주기(%ldms)를 넘긴다.\n"
@@ -272,6 +279,9 @@ void runMqtt(navi::Robot& robot, const navi::Config& cfg) {
                 case K::Wheel:    robot.setWheelRpm(c->wheel, c->ramp); break;
                 case K::Body:     robot.setBodyVelocity(c->body, c->ramp); break;
                 case K::Actuator: robot.actuatorStart(c->actuator_ret, c->actuator_duty); break;
+                // 🔴 e-stop 중에도 통과한다(setLed 이 게이트를 안 쓴다). 의도된 것이다 —
+                //    멈춘 뒤에도 상황을 봐야 한다. 워치독도 갱신하지 않는다.
+                case K::Led:      robot.setLed(c->led_on); break;
                 case K::Stop:     robot.stopDrive(); break;
                 case K::Estop:    robot.estop(c->reason); break;
                 case K::Reset:    robot.reset(); break;

@@ -137,6 +137,23 @@ inline ConfLoad loadConf(Config& cfg, const char* explicit_path = nullptr) {
             cfg.thermal.cdc_port = labelPool().back().c_str();
             r.applied.push_back(k);
         }
+        // de_line 과 같은 이유로 strtoul 이다 — inum 은 int& 를 받는데 line 은 unsigned 다
+        else if (k == "led_line")         { unsigned u = std::strtoul(v.c_str(), nullptr, 10);
+                                            cfg.led.line = u; r.applied.push_back(k); }
+        else if (k == "led_on_boot") {
+            cfg.led.on_boot = (v != "0" && v != "false");
+            r.applied.push_back(k);
+        }
+        else if (k == "led_enabled") {
+            cfg.led.enabled = (v != "0" && v != "false");
+            r.applied.push_back(k);
+        }
+        else if (k == "led_chip") {
+            // labelPool 은 deque 다 — vector 면 재할당 때 c_str() 이 무효화된다
+            labelPool().push_back(v);
+            cfg.led.chip = labelPool().back().c_str();
+            r.applied.push_back(k);
+        }
         else if (k == "thermal_use_sdk") { cfg.thermal.use_sdk = (v != "0" && v != "false"); r.applied.push_back(k); }
         else if (k == "thermal_enabled") {
             cfg.thermal.enabled = (v != "0" && v != "false");
