@@ -103,6 +103,16 @@ class VehicleCounter:
                 f"{'(차 밑)' if self.under else '(차 사이)'}")
 
 
+def notice_stale(until, now):
+    """event 알림을 지울 때가 됐나. `until is None` = 만료시키지 않는다(접속 상태 등).
+
+    순수 함수로 빼둔 이유: 만료 로직이 틀리면 둘 중 하나가 된다 —
+    영원히 안 지워져서 순간 사건이 상태처럼 붙어 있거나(2026-09-03 지적받은 그 버그),
+    즉시 지워져서 알림을 못 본다. 둘 다 눈으로는 늦게 발견된다.
+    """
+    return until is not None and now > until
+
+
 def fmt_state(d):
     """state JSON → 화면에 뿌릴 (구동, 센서, 경고) 문자열 3개. 없는 필드는 '-' 로 둔다."""
     wheels = d.get("wheels") or []
@@ -338,6 +348,12 @@ def selftest():
     assert c.n == 0 and c.under is True
     assert c.feed(tof(10), 30.0) is False and c.n == 0
 
+    # event 알림 만료: None 은 영구(접속 상태), 숫자는 그 시각 이후 사라진다
+    assert notice_stale(None, 1e9) is False, "None 은 만료시키지 않는다"
+    assert notice_stale(100.0, 99.9) is False
+    assert notice_stale(100.0, 100.1) is True
+    assert notice_stale(0.0, 0.0) is False, "같은 시각은 아직 유효"
+
     # 🔴 워치독은 경고(빨간 줄)에 들어가면 안 된다 — 정지 중 거의 항상 켜져 있다
     dr, _, wn = fmt_state({"watchdog": True, "drive_ok": True, "wheels_alive": 4})
     assert "워치독" not in wn, wn
@@ -381,6 +397,8 @@ def main():
                     help="구동 허용 토글 토픽. navi 접두사 밖이라 로봇은 구독하지 않는다")
     ap.add_argument("--dump-layout", action="store_true",
                     help="4초 뒤 위젯 할당 크기를 찍고 종료 (원격에서 비율 확인용)")
+    ap.add_argument("--notice-secs", type=float, default=8.0,
+                    help="event 알림을 몇 초 보여줄지 (순간 사건이라 만료시킨다)")
     ap.add_argument("--lift-block-topic", default="ipc/lift_blocked",
                     help="crevis-io 가 발행하는 리프트 막힘 알람 (retain)")
     ap.add_argument("--under-cm", type=float, default=UNDER_CM,
@@ -726,7 +744,22 @@ def main():
     # ---------- MQTT ----------
     alarms = {}
     th_seen = {}                  # 열화상 frames 감시용 (thermal_stalled 참조)
-    notice = {"txt": ""}          # 최근 event / 접속 상태. state 줄 끝에 얹는다
+    # 최근 event / 접속 상태. state 줄 끝에 얹는다.
+    # 🔴 `until` 로 **만료**시킨다. event 는 "그 순간 일어난 일" 인데 지우지 않으면
+    #    상태처럼 화면에 영원히 붙어 있다 — 2026-09-03 에 `event watchdog 명령끊김으로
+    #    정지` 가 상시 떠 있다는 지적을 받았고, navi 는 상승엣지에서 **한 번만** 보낸다
+    #    (main.cpp: `if (tripped && !was_wd) publishEvent(...)`). 즉 우리 표시 문제였다.
+    #    접속 상태처럼 계속 보여야 하는 것은 until=None 으로 둔다.
+    notice = {"txt": "", "until": None}
+
+    def notice_txt():
+        if notice_stale(notice["until"], time.monotonic()):
+            notice["txt"], notice["until"] = "", None
+        return notice["txt"]
+
+    def set_notice(txt, secs=None):
+        notice["txt"] = txt
+        notice["until"] = None if secs is None else time.monotonic() + secs
 
     def on_connect(c, _u, _f, rc):
         c.subscribe([(f"{a.prefix}/state", 0), (f"{a.prefix}/event", 1),
@@ -737,11 +770,11 @@ def main():
         # 접속할 때마다 무조건 잠금부터 발행한다 — 기본값이 안전이어야 한다
         c.publish(a.enable_topic, '{"on":false}', qos=1, retain=True)
         GLib.idle_add(tgl.set_active, False)
-        notice["txt"] = ""
+        set_notice("")
         GLib.idle_add(lbl_drive.set_text, f"MQTT 연결 (rc={rc}) — 상태 수신 대기")
 
     def on_disconnect(_c, _u, rc):
-        notice["txt"] = f"⚠ MQTT 끊김(rc={rc}) 재접속 중"
+        set_notice(f"⚠ MQTT 끊김(rc={rc}) 재접속 중")   # 상태다 — 만료시키지 않는다
         GLib.idle_add(lbl_warn.set_text, notice["txt"])
 
     def on_message(_c, _u, msg):
@@ -787,11 +820,17 @@ def main():
             GLib.idle_add(show_count)
 
             drive, sensor, warn = fmt_state(d)
-            act = " · ".join(f"{k}:{v}" for k, v in sorted(alarms.items()))
+            # 🔴 `watchdog` 알람은 표시하지 않는다. `state.watchdog` 과 **같은 정보**이고
+            #    (navi 가 그 플래그를 그대로 알람으로 발행한다: main.cpp `set(a.watchdog,
+            #    s.watchdog_tripped, ...)`), 정지 중에는 래치돼 항상 active:true 다.
+            #    retain 이라 브로커에도 계속 남아 접속만 하면 다시 뜬다. 같은 사실을
+            #    세 곳(플래그·알람·이벤트)에서 보여줄 이유가 없다 → 구동 줄 표기 하나로 통일.
+            act = " · ".join(f"{k}:{v}" for k, v in sorted(alarms.items())
+                             if k != "watchdog")
             GLib.idle_add(lbl_drive.set_text,
                           drive + (f"   │   알람 {act}" if act else "   │   알람 없음"))
             GLib.idle_add(lbl_sensor.set_text,
-                          sensor + (f"   │   {notice['txt']}" if notice["txt"] else ""))
+                          sensor + (f"   │   {nt}" if (nt := notice_txt()) else ""))
             th = d.get("thermal") or {}
             if a.hot_c > 0 and th.get("valid"):
                 # lo·hi 가 바뀔 때만 LUT 을 다시 만든다. 프레임마다 하면 낭비다.
@@ -817,7 +856,9 @@ def main():
             else:
                 GLib.idle_add(lbl_warn.set_text, "⚠ 로봇 오프라인 (navi 정지 또는 통신 두절)")
         elif sub == "event":
-            notice["txt"] = f"event {d.get('event')} {d.get('detail', '')}".strip()[:100]
+            # event 는 순간이다 → a.notice_secs 뒤 사라진다 (위 notice 주석 참고)
+            set_notice(f"event {d.get('event')} {d.get('detail', '')}".strip()[:100],
+                       a.notice_secs)
 
     def on_switch(old, new):
         # 경로가 바뀌면 영상도 따라간다. host 는 워커가 cli.host 로 맞추므로 여기서 안 만진다
