@@ -108,7 +108,9 @@ def fmt_state(d):
     wheels = d.get("wheels") or []
     rpm = " ".join(f"{w.get('label', '?')}{w.get('rpm', 0):+.0f}" for w in wheels) or "축 없음"
     drive = (f"구동 {'OK' if d.get('drive_ok') else 'X'} · "
-             f"{d.get('wheels_alive', 0)}축 · {rpm}")
+             f"{d.get('wheels_alive', 0)}축 · {rpm}"
+             # 정보는 남기되 경고색을 입히지 않는다 (위 주석 참고)
+             + ("  · 워치독(명령대기)" if d.get("watchdog") else ""))
 
     tof = d.get("tof") or {}
     th = d.get("thermal") or {}
@@ -123,11 +125,20 @@ def fmt_state(d):
     sensor = (f"{dist}   ·   열화상 {th.get('lo', '-')}~{th.get('hi', '-')}℃ "
               f"중앙 {th.get('center', '-')} ({th.get('fps', '-')}fps)")
 
+    # 🔴 워치독 플래그는 **빨간 경고에 넣지 않는다** (2026-09-03 사용자 지적).
+    #    정지 중에는 거의 항상 켜져 있어서 정보가 0인데, 빨간 글씨라 계속 신경 쓰인다.
+    #    이유(소스·실측으로 확인):
+    #      · 트립 조건은 `명령이 500ms 없음 + moving()` 이다
+    #      · `moving()` 은 축 스탬프가 `motor_timeout`(100ms)보다 오래되면
+    #        **"모름 → 움직인다고 간주"** 로 true 를 낸다 (fail-safe)
+    #      · 그런데 정지 중에는 폴링이 5Hz 로 떨어져(kIdleDivider=10) 축당 갱신이
+    #        ~800ms 다 → 스탬프가 항상 오래됐다 → moving()==true
+    #      · 게다가 플래그는 **다음 명령까지 래치**된다(acceptCommon 에서만 해제)
+    #    즉 "가만히 있을 때 워치독 정지" 는 정상이다. 실주행 중 명령 유실은
+    #    `event` 알림(아래 notice)이 그때그때 알려주므로 정보가 사라지지 않는다.
     warn = []
     if d.get("estop"):
         warn.append(f"E-STOP 래치: {d.get('estop_reason') or '사유 없음'} — 해제 버튼으로만 풀린다")
-    if d.get("watchdog"):
-        warn.append("워치독 정지")
     if not d.get("drive_ok"):
         warn.append(d.get("drive_error") or "구동계 없음")
     if tof.get("present") and not tof.get("valid"):
@@ -326,6 +337,14 @@ def selftest():
     c.reset()
     assert c.n == 0 and c.under is True
     assert c.feed(tof(10), 30.0) is False and c.n == 0
+
+    # 🔴 워치독은 경고(빨간 줄)에 들어가면 안 된다 — 정지 중 거의 항상 켜져 있다
+    dr, _, wn = fmt_state({"watchdog": True, "drive_ok": True, "wheels_alive": 4})
+    assert "워치독" not in wn, wn
+    assert "워치독" in dr, "구동 줄에는 남아 있어야 한다(정보 유실 금지)"
+    # e-stop 은 여전히 경고다
+    _, _, wn2 = fmt_state({"estop": True, "estop_reason": "테스트"})
+    assert "E-STOP" in wn2 and "테스트" in wn2
 
     print("selftest OK")
 
