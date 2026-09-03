@@ -397,12 +397,18 @@ def main():
                     help="구동 허용 토글 토픽. navi 접두사 밖이라 로봇은 구독하지 않는다")
     ap.add_argument("--dump-layout", action="store_true",
                     help="4초 뒤 위젯 할당 크기를 찍고 종료 (원격에서 비율 확인용)")
-    # 🔴 열화상 PiP 는 **명령과 같은 MQTT 소켓**으로 온다(14KB BMP/프레임).
-    #    fps 를 높이면 작은 구동 명령이 큰 프레임 뒤에 줄을 서서(head-of-line 블로킹)
-    #    무선 거리가 멀 때 로봇 워치독을 트립시킨다 — 2026-09-03 실측으로 확인했다.
-    #    10 → 4 로 내렸다(1.1 → 0.45 Mbps). 열 감시 용도로는 4 fps 도 충분하다.
-    ap.add_argument("--thermal-fps", type=int, default=4,
-                    help="열화상 PiP fps. 명령과 같은 소켓을 쓰므로 높으면 명령이 밀린다")
+    # 열화상 PiP 는 14KB BMP 를 프레임마다 보낸다 → 10 fps 면 약 1.1 Mbps.
+    #
+    # ⚠️ 정정(2026-09-03): 처음에 "명령과 같은 MQTT 소켓이라 head-of-line 블로킹" 이라고
+    #    적었는데 **틀렸다.** `frame/thermal` 을 구독하는 건 **콘솔뿐**이고, 구동 명령을
+    #    발행하는 joy-teleop·joy2-teleop·crevis-io 는 각자 **별도 TCP 연결**이다
+    #    (각 서비스가 자기 mqtt_link.Link 를 가진다). 즉 열화상은 명령 큐를 막지 않고
+    #    **공기 시간만** 잡아먹는다 — 무선 경합에는 여전히 기여하지만 영상만큼 직접적이지 않다.
+    #
+    # 그래서 10 으로 되돌렸다(사용자 요청): 열화상은 카메라가 ~8 fps 라 이미 느려서
+    # 더 낮추면 안 보인다. 대역이 필요하면 **영상(video_bps/video_fps)** 을 먼저 줄인다.
+    ap.add_argument("--thermal-fps", type=int, default=10,
+                    help="열화상 PiP fps. 카메라가 ~8fps 라 그 이상은 의미 없다")
     ap.add_argument("--notice-secs", type=float, default=8.0,
                     help="event 알림을 몇 초 보여줄지 (순간 사건이라 만료시킨다)")
     ap.add_argument("--lift-block-topic", default="ipc/lift_blocked",
