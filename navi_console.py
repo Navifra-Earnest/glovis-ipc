@@ -397,6 +397,12 @@ def main():
                     help="구동 허용 토글 토픽. navi 접두사 밖이라 로봇은 구독하지 않는다")
     ap.add_argument("--dump-layout", action="store_true",
                     help="4초 뒤 위젯 할당 크기를 찍고 종료 (원격에서 비율 확인용)")
+    # 🔴 열화상 PiP 는 **명령과 같은 MQTT 소켓**으로 온다(14KB BMP/프레임).
+    #    fps 를 높이면 작은 구동 명령이 큰 프레임 뒤에 줄을 서서(head-of-line 블로킹)
+    #    무선 거리가 멀 때 로봇 워치독을 트립시킨다 — 2026-09-03 실측으로 확인했다.
+    #    10 → 4 로 내렸다(1.1 → 0.45 Mbps). 열 감시 용도로는 4 fps 도 충분하다.
+    ap.add_argument("--thermal-fps", type=int, default=4,
+                    help="열화상 PiP fps. 명령과 같은 소켓을 쓰므로 높으면 명령이 밀린다")
     ap.add_argument("--notice-secs", type=float, default=8.0,
                     help="event 알림을 몇 초 보여줄지 (순간 사건이라 만료시킨다)")
     ap.add_argument("--lift-block-topic", default="ipc/lift_blocked",
@@ -766,7 +772,7 @@ def main():
                      (f"{a.prefix}/alarm/#", 1), (f"{a.prefix}/state/online", 1),
                      (f"{a.prefix}/frame/thermal", 0), (a.lift_block_topic, 1)])
         # 프레임 발행은 기본 꺼져 있다 — 켜야 frame/thermal 이 온다
-        c.publish(f"{a.prefix}/cmd/stream", json.dumps({"on": True, "fps": 10}), qos=1)
+        c.publish(f"{a.prefix}/cmd/stream", json.dumps({"on": True, "fps": a.thermal_fps}), qos=1)
         # 접속할 때마다 무조건 잠금부터 발행한다 — 기본값이 안전이어야 한다
         c.publish(a.enable_topic, '{"on":false}', qos=1, retain=True)
         GLib.idle_add(tgl.set_active, False)
@@ -852,7 +858,7 @@ def main():
             if d.get("online"):
                 # navi 가 재시작하면 프레임 발행이 기본값(꺼짐)으로 돌아간다. 브로커는 그대로라
                 # on_connect 가 다시 안 불리므로 여기서 켜줘야 열화상 PiP 가 살아난다.
-                _c.publish(f"{a.prefix}/cmd/stream", json.dumps({"on": True, "fps": 10}), qos=1)
+                _c.publish(f"{a.prefix}/cmd/stream", json.dumps({"on": True, "fps": a.thermal_fps}), qos=1)
             else:
                 GLib.idle_add(lbl_warn.set_text, "⚠ 로봇 오프라인 (navi 정지 또는 통신 두절)")
         elif sub == "event":
