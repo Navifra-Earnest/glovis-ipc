@@ -61,32 +61,33 @@ def guide_tick_xs(y):
 #  `--under-cm` 만 바꾸면 되고 판정 구조는 그대로다.)
 # 판정 기준은 사용자 지정(2026-09-02):
 #
-#   0.2 m 이하가 3초 유지   → +1대
-#   그 이상이 1초 이상 유지 → 차 사이 통과 중 = 다음 대를 셀 준비
+#   0.2 m 이하가 2초 유지     → +1대
+#   그 이상이 0.5초 이상 유지 → 차 사이 통과 중 = 다음 대를 셀 준비
+#
+# 3초/1초 → 2초/0.5초 (2026-09-08 사용자 변경): 차량이 촘촘히 서 있으면 차 사이를
+# 1초 안에 지난다. ToF 데이터가 일정하게 들어오는 게 확인돼서 두 값을 같이 줄였다.
 #
 # 🔴 `under` 은 **valid 를 반드시 본다.** `valid` 는 신호강도 판정이고 false 면 거리값이
 #    쓰레기라 작은 값이 튀어나올 수 있다(fmt_state 주석 참고) — 그걸 "차 밑" 으로 세면
 #    허깨비 차량이 생긴다. 그리고 물리적으로도 **무효 = 위에 반사할 것이 없음 = 차 사이**다.
 #    즉 판정은 하나로 정리된다: `valid 하고 임계 이하일 때만 차 밑`, 나머지는 전부 차 사이.
-UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 20.0, 3.0, 1.0   # 0.2 m (2026-09-02 사용자 변경)
+UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 20.0, 2.0, 0.5   # 0.2 m (2026-09-02 사용자 변경)
 ICONS = "🚗 🚗"       # 첫 줄 고정. 대수·상태와 무관하게 그대로 둔다(사용자 지정)
 
 
 class VehicleCounter:
-    """지나간 차량 수. 히스테리시스(진입 3초 / 이탈 1초)로 튐과 이중계수를 막는다.
+    """지나간 차량 수. 히스테리시스(진입 2초 / 이탈 0.5초)로 튐과 이중계수를 막는다.
 
-    이탈에 1초를 요구하는 이유: 차 밑에서 거리값이 순간 튀어도(배선·요철) 차에서
+    이탈에 시간을 요구하는 이유: 차 밑에서 거리값이 순간 튀어도(배선·요철) 차에서
     나온 것으로 보지 않는다. 그래서 한 대를 두 번 세지 않는다.
+
+    e-stop 해제로는 0 이 되지 않는다(2026-09-08). 0 으로 되돌리려면 **물리 리셋
+    버튼**을 누른다 — 그게 navi-console 을 재시작하므로 카운터도 함께 0 이 된다.
     """
 
     def __init__(self, under_cm=UNDER_CM, under_hold=UNDER_HOLD_S, gap_hold=GAP_HOLD_S):
         self.under_cm, self.under_hold, self.gap_hold = under_cm, under_hold, gap_hold
         self.n, self.under, self.raw, self.since = 0, False, None, 0.0
-
-    def reset(self):
-        """카운터만 0 으로. 현재 차 밑인지 여부는 유지한다 —
-        리셋했다고 지금 밑에 있는 차를 다시 세면 안 된다."""
-        self.n = 0
 
     def feed(self, tof, now):
         """state.tof 한 샘플. 반환: 이번 호출로 +1 됐나."""
@@ -307,21 +308,27 @@ def selftest():
     def tof(cm, valid=True, present=True):
         return {"dist_cm": cm, "valid": valid, "present": present}
 
+    # 🔴 시각을 상수에서 계산한다. 예전엔 3초·1초를 그대로 박아뒀다가 임계를 2초·0.5초로
+    #    줄이자 통째로 깨졌다 — 값이 바뀌어도 **규칙**은 그대로여야 한다.
+    U, G, E = UNDER_HOLD_S, GAP_HOLD_S, 0.05      # E = 경계 확인용 여유
     c = VehicleCounter()
-    assert c.feed(tof(80), 0.0) is False and c.n == 0          # 차 사이
-    assert c.feed(tof(10), 1.0) is False and c.n == 0          # 진입 — 아직 3초 안 됐다
-    assert c.feed(tof(10), 3.9) is False and c.n == 0
-    assert c.feed(tof(10), 4.0) is True and c.n == 1           # 3초 유지 → +1
-    assert c.feed(tof(10), 9.0) is False and c.n == 1, "유지 중에 또 세면 안 된다"
-    # 차 밑에서 값이 순간 튀어도 1초를 못 넘기면 이탈이 아니다 → 이중계수 없음
-    assert c.feed(tof(80), 9.5) is False and c.under is True
-    assert c.feed(tof(10), 10.0) is False and c.n == 1
-    assert c.feed(tof(10), 20.0) is False and c.n == 1, "재진입으로 세면 안 된다"
-    # 1초 이상 벗어나면 차 사이 → 다음 대를 셀 준비
-    assert c.feed(tof(80), 21.0) is False and c.under is True  # 아직 1초 안 됨
-    assert c.feed(tof(80), 22.1) is False and c.under is False
-    assert c.feed(tof(10), 23.0) is False and c.n == 1
-    assert c.feed(tof(10), 26.0) is True and c.n == 2, "두 번째 차"
+    assert c.feed(tof(80), 0.0) is False and c.n == 0                 # 차 사이
+    assert c.feed(tof(10), 1.0) is False and c.n == 0                 # 진입 — 유지시간 전
+    assert c.feed(tof(10), 1.0 + U - E) is False and c.n == 0
+    assert c.feed(tof(10), 1.0 + U) is True and c.n == 1              # 유지 충족 → +1
+    t = 1.0 + U
+    assert c.feed(tof(10), t + 5) is False and c.n == 1, "유지 중에 또 세면 안 된다"
+    # 차 밑에서 값이 순간 튀어도 이탈시간을 못 넘기면 이탈이 아니다 → 이중계수 없음
+    assert c.feed(tof(80), t + 5 + G - E) is False and c.under is True
+    assert c.feed(tof(10), t + 6) is False and c.n == 1
+    assert c.feed(tof(10), t + 16) is False and c.n == 1, "재진입으로 세면 안 된다"
+    # 이탈시간을 넘기면 차 사이 → 다음 대를 셀 준비
+    t = t + 17
+    assert c.feed(tof(80), t) is False and c.under is True             # 타이머 시작
+    assert c.feed(tof(80), t + G) is False and c.under is False
+    assert c.feed(tof(10), t + G + 1) is False and c.n == 1
+    assert c.feed(tof(10), t + G + 1 + U) is True and c.n == 2, "두 번째 차"
+    assert (UNDER_HOLD_S, GAP_HOLD_S) == (2.0, 0.5), "사용자 지정 2초 / 0.5초"
 
     # 🔴 무효값은 절대 차 밑으로 세지 않는다 — false 면 작은 값이 튀어나올 수 있다
     c2 = VehicleCounter()
@@ -336,10 +343,10 @@ def selftest():
     # 경계값: 임계값 자체는 "이하" 라서 포함이다
     c3 = VehicleCounter()
     c3.feed(tof(UNDER_CM), 0.0)
-    assert c3.feed(tof(UNDER_CM), 3.0) is True, "임계값은 이하 = 차 밑"
+    assert c3.feed(tof(UNDER_CM), U) is True, "임계값은 이하 = 차 밑"
     c4 = VehicleCounter()
     c4.feed(tof(UNDER_CM + 1), 0.0)
-    assert c4.feed(tof(UNDER_CM + 1), 5.0) is False and c4.n == 0
+    assert c4.feed(tof(UNDER_CM + 1), U + 1) is False and c4.n == 0
     assert UNDER_CM == 20.0, "사용자 지정 0.2 m"
     # 세 줄이어야 한다(아이콘 / 대수 / 상태). 줄 수가 흔들리면 하단 바 높이가 들썩인다
     for cc in (c3, c4, VehicleCounter()):
@@ -354,10 +361,8 @@ def selftest():
         assert lines[1] == f"{n}대 통과"
         assert lines[2] == ("(차 밑)" if under else "(차 사이)")
 
-    # 리셋은 카운터만 — 지금 차 밑인 사실은 유지한다(리셋 후 재계수 금지)
-    c.reset()
-    assert c.n == 0 and c.under is True
-    assert c.feed(tof(10), 30.0) is False and c.n == 0
+    # 리셋 경로는 없앴다(2026-09-08) — 카운터를 0 으로 만드는 조작이 없어야 한다
+    assert not hasattr(c, "reset"), "e-stop 해제로 카운터가 0 이 되면 안 된다"
 
     # event 알림 만료: None 은 영구(접속 상태), 숫자는 그 시각 이후 사라진다
     assert notice_stale(None, 1e9) is False, "None 은 만료시키지 않는다"
@@ -683,7 +688,6 @@ def main():
     lift_block = {"txt": ""}        # crevis-io 가 알려주는 리프트 막힘 사유
     warn_state = {"txt": ""}        # 로봇 state 에서 온 경고
     counter = VehicleCounter(a.under_cm, a.under_hold, a.gap_hold)
-    prev_estop = {"v": None}        # e-stop 해제(True→False) 를 잡기 위한 직전값
 
     def show_count():
         """차 밑이면 초록(#count_under), 차 사이면 노랑(#count). 이름을 바꿔 끼운다."""
@@ -742,16 +746,14 @@ def main():
     btns.pack_start(tgl, True, True, 0)
 
     def on_reset_clicked(_w):
-        """E-STOP 해제 버튼. 차량 카운터도 여기서 0 으로 만든다.
+        """E-STOP 해제 버튼. **차량 카운터는 건드리지 않는다** (2026-09-08 사용자 지정).
 
-        🔴 state 의 estop True→False 전이만 보면 **e-stop 이 안 걸려 있을 때는
-           카운터를 리셋할 방법이 없다**(전이가 없으니까). 사용자 의도는 "리셋 조작으로
-           0 을 만든다" 이므로 버튼 자체에도 건다. 두 경로 다 조종자의 명시적 조작이다.
+        전에는 여기서(그리고 state 의 estop True→False 전이에서) 카운터를 0 으로
+        만들었다. 운용 중 e-stop 은 카운트와 무관한 이유로도 걸리므로, 해제할 때마다
+        누적 대수가 날아가는 게 손해였다. 0 으로 만들려면 **물리 리셋 버튼**을 누른다
+        (crevis_io 가 navi-console 을 재시작한다).
         """
         send("cmd/reset")
-        counter.reset()
-        GLib.idle_add(show_count)
-        print("[차량] 리셋 버튼 — 카운터 0 으로", flush=True)
 
     for label, name, topic, payload in (
             ("■ E-STOP", "estop", "cmd/estop", '{"reason":"콘솔 버튼"}'),
@@ -833,13 +835,10 @@ def main():
         except ValueError:
             return
         if sub == "state":
-            # ── 차량 카운터. 리셋은 **e-stop 해제**다(사용자 지정) — 즉 조종자가
-            #    의도적으로 RESET 을 눌렀을 때만 0 이 된다. 접속·재연결로는 안 바뀐다.
-            es = bool(d.get("estop"))
-            if prev_estop["v"] is True and es is False:
-                counter.reset()
-                print("[차량] e-stop 해제 — 카운터 0 으로", flush=True)
-            prev_estop["v"] = es
+            # ── 차량 카운터는 **리셋 경로가 없다** (2026-09-08 사용자 지정).
+            #    e-stop 해제로 0 이 되게 했었는데, e-stop 은 카운트와 무관한 이유로도
+            #    걸리니 해제할 때마다 누적이 날아갔다. 0 은 **물리 리셋 버튼**으로 만든다
+            #    (crevis_io 가 navi-console 을 재시작한다).
             if counter.feed(d.get("tof") or {}, time.monotonic()):
                 print(f"[차량] {counter.n}대 통과", flush=True)
             GLib.idle_add(show_count)
