@@ -92,8 +92,22 @@ class VehicleCounter:
     def feed(self, tof, now):
         """state.tof 한 샘플. 반환: 이번 호출로 +1 됐나."""
         cm = tof.get("dist_cm")
-        raw = bool(tof.get("present") and tof.get("valid")
-                   and cm is not None and cm <= self.under_cm)
+        # 🔴 **모름은 차 사이가 아니다.** 측정이 없는 샘플은 통째로 버린다 —
+        #    직전 판정을 유지하고 유지시간 타이머도 건드리지 않는다.
+        #
+        #    0 cm 은 실측값일 수 없다(TF-Luna 최소거리 0.2 m). "측정 실패" 코드다.
+        #    그런데 navi 의 `valid` 는 **강도만** 보고 거리값은 안 본다(tof.hpp:141)
+        #    → 0 이 두 방향으로 다 틀린다:
+        #      · 강도 낮음 → raw=False → 타이머 리셋 → 차 밑인데 2초를 못 채워
+        #        **안 세진다** (2026-09-08 사용자 보고: 무선 지연·끊김 중 발생)
+        #      · 강도 높음 → `0 <= 20` 이라 raw=True → **허깨비 차량**
+        #    센서 없음(present=False)·필드 누락도 같은 부류라 함께 막는다.
+        #
+        #    MQTT 가 그냥 늦게 오는 것은 이미 문제가 아니다 — feed 가 안 불릴 뿐이고
+        #    raw 가 안 바뀌면 since 도 그대로라 유지시간이 계속 누적된다.
+        if not tof.get("present") or cm is None or cm == 0:
+            return False
+        raw = bool(tof.get("valid") and cm <= self.under_cm)
         if raw != self.raw:                       # 원시 판정이 바뀌면 타이머를 다시 잡는다
             self.raw, self.since = raw, now
         held = now - self.since
@@ -139,6 +153,10 @@ def fmt_state(d):
     cm, sig = tof.get("dist_cm"), tof.get("strength")
     if not tof.get("present"):
         dist = "거리 센서없음"
+    elif cm == 0:
+        # 0 cm 은 실측일 수 없다(최소거리 0.2 m) = 측정 실패. navi 의 valid 는 강도만
+        # 보므로 강도가 높으면 이게 valid=true 로 온다 → "0.00 m" 로 찍혀 오해를 산다.
+        dist = f"거리 측정없음 (강도 {sig})"
     elif not tof.get("valid"):
         # valid 는 신호강도 판정이다 — false 면 거리값 자체가 쓰레기이므로 숫자를 아예 안 띄운다
         dist = f"거리 무효(강도 {sig})"
@@ -329,6 +347,29 @@ def selftest():
     assert c.feed(tof(10), t + G + 1) is False and c.n == 1
     assert c.feed(tof(10), t + G + 1 + U) is True and c.n == 2, "두 번째 차"
     assert (UNDER_HOLD_S, GAP_HOLD_S) == (2.0, 0.5), "사용자 지정 2초 / 0.5초"
+
+    # 🔴 이번 버그: 2초를 세는 중에 0 cm(측정 실패) 이 섞여도 타이머가 리셋되면 안 된다.
+    #    무선 지연·끊김에서 이게 들어와 차 밑인데도 안 세졌다 (2026-09-08).
+    c6 = VehicleCounter()
+    assert c6.feed(tof(10), 0.0) is False                       # 진입 — 타이머 시작
+    for t, bad in ((0.5, tof(0)), (0.9, tof(0, valid=False)),   # 강도 높음/낮음 둘 다
+                   (1.2, tof(None)), (1.5, tof(5, present=False))):
+        assert c6.feed(bad, t) is False and c6.n == 0, (t, bad)
+    assert c6.feed(tof(10), U) is True and c6.n == 1, "0 때문에 타이머가 리셋됐다"
+
+    # 0 cm 은 허깨비 차량이 되어서도 안 된다 (강도가 높으면 `0 <= 20` 이 참이다)
+    c7 = VehicleCounter()
+    for t in (0.0, U, U * 2, U * 3):
+        assert c7.feed(tof(0), t) is False
+    assert c7.n == 0 and c7.under is False, "0 cm 을 차 밑으로 셌다"
+
+    # 모름이 이어지는 동안 직전 판정은 유지된다 — 차 밑이었으면 차 밑로 남는다
+    c8 = VehicleCounter()
+    c8.feed(tof(10), 0.0)
+    assert c8.feed(tof(10), U) is True and c8.under is True
+    for t in (U + 1, U + 9):
+        c8.feed(tof(0), t)
+    assert c8.under is True, "모름을 차 사이로 봤다"
 
     # 🔴 무효값은 절대 차 밑으로 세지 않는다 — false 면 작은 값이 튀어나올 수 있다
     c2 = VehicleCounter()

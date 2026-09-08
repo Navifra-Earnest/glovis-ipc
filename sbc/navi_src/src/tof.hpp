@@ -138,7 +138,10 @@ private:
         r.strength = amp;
         r.temp_c = traw / 8.0 - 256.0;      // 데이터시트 변환식
         r.stamp = std::chrono::steady_clock::now();
-        r.valid = (amp >= cfg_.min_strength && amp != 65535);
+        // 🔴 거리 0 도 무효다. 강도만 보면 0 cm 이 valid=true 로 나가고, 상위는
+        //    "0.00 m" 를 실측처럼 표시하거나 임계 이하로 세어버린다(2026-09-08 실사례).
+        //    TF-Luna 최소거리가 0.2 m 라 0 은 "측정 실패" 코드다.
+        r.valid = (dist > 0 && amp >= cfg_.min_strength && amp != 65535);
         return true;
     }
 
@@ -252,8 +255,10 @@ private:
                 r.dist_cm  = buf[i + 2] | (buf[i + 3] << 8);
                 r.strength = buf[i + 4] | (buf[i + 5] << 8);
                 r.temp_c   = (buf[i + 6] | (buf[i + 7] << 8)) / 8.0 - 256.0;
-                // 강도로 신뢰도를 가린다 — 상위가 매번 판단하게 두지 않는다
-                r.valid = (r.strength >= cfg_.min_strength && r.strength != 65535);
+                // 강도로 신뢰도를 가린다 — 상위가 매번 판단하게 두지 않는다.
+                // 거리 0 도 무효다 (I2C 경로 주석 참고 — 0 은 측정 실패 코드다).
+                r.valid = (r.dist_cm > 0 && r.strength >= cfg_.min_strength
+                           && r.strength != 65535);
                 r.stamp = Clock::now();
                 {
                     std::lock_guard<std::mutex> lk(mu_);
