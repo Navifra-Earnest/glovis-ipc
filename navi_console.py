@@ -74,6 +74,51 @@ def guide_tick_xs(y):
 UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 20.0, 2.0, 0.5   # 0.2 m (2026-09-02 사용자 변경)
 ICONS = "🚗 🚗"       # 첫 줄 고정. 대수·상태와 무관하게 그대로 둔다(사용자 지정)
 
+# ── 주행 방향 게이트 (2026-09-08 사용자 지정) ────────────────────────────
+# 전진 중에만 +1, 후진 중에만 -1, 정지 중에는 세지 않는다.
+#
+# 🔴 **로봇의 물리적 전진은 명령상 `vy`(게걸음) 축이다.** 조이스틱을 -90° 돌려
+#    장착해서 쓰기 때문이다 — 조종자가 "전진" 으로 미는 입력이 게걸음 지령으로 나간다.
+#    두 조이스틱 다 같은 축을 쓴다(joy2_teleop 은 to_body 에서 코드로, 기존 것은
+#    장치를 물리적으로 돌려서). 그래서 아래 한 줄이 두 조종기를 다 커버한다.
+#
+#    아래는 joy_teleop.MIX 의 **vy 열**이다 (행 = FL FR RL RR):
+#        vx 열 (1, 1, 1, 1)      ← 코드가 "전후진" 이라 부르지만 물리적으로는 좌우
+#        vy 열 (-1, 1, 1, -1)    ← 물리적 전후진. **이걸 쓴다**
+#        wz 열 (-1, 1, -1, 1)    ← 제자리 회전
+#
+#    vy 열은 vx·wz 열과 **직교**한다(내적 0). 그래서 게걸음·회전이 아무리 섞여도
+#    이 투영값에는 안 새어든다 — "각속도가 섞여 있어도 선속도로만 판정" 이 공짜로 된다.
+#    (selftest 가 직교성을 검증한다. MIX 를 고치면 거기서 잡힌다)
+#
+# ⚠️ 전/후진 **부호**는 실기 확인 사항이다. 대수가 반대로 움직이면 여기만 뒤집는다.
+FWD_MIX = (-1.0, +1.0, +1.0, -1.0)
+FWD_EPS_RPM = 0.2      # 이보다 작은 투영은 방향 없음 (반올림·잔여 지령 무시)
+CMD_STALE_S = 1.0      # 이 시간 넘게 cmd 가 없으면 정지. teleop 은 멈추면 발행을 끊는다
+
+
+def fwd_dir(rpm, eps=FWD_EPS_RPM):
+    """cmd/wheel 의 [FL, FR, RL, RR] → 물리적 전진 방향 (+1 / 0 / -1).
+
+    순수 함수다. 회전·게걸음 성분은 직교라서 저절로 떨어진다.
+    """
+    if not rpm or len(rpm) != 4:
+        return 0
+    try:
+        v = sum(m * float(r or 0.0) for m, r in zip(FWD_MIX, rpm)) / 4.0
+    except (TypeError, ValueError):
+        return 0
+    return 0 if abs(v) < eps else (1 if v > 0 else -1)
+
+
+def cmd_dir(d, at, now, stale=CMD_STALE_S):
+    """마지막 명령의 방향 — 너무 오래됐으면 정지(0)로 본다.
+
+    teleop 은 스틱을 놓으면 `cmd/stop` 한 번만 보내고 발행을 끊는다. 그래서
+    "최근 명령이 없음" 이 곧 정지다. 로봇의 워치독과 같은 논리다.
+    """
+    return 0 if at is None or now - at > stale else d
+
 
 class VehicleCounter:
     """지나간 차량 수. 히스테리시스(진입 2초 / 이탈 0.5초)로 튐과 이중계수를 막는다.
@@ -89,8 +134,14 @@ class VehicleCounter:
         self.under_cm, self.under_hold, self.gap_hold = under_cm, under_hold, gap_hold
         self.n, self.under, self.raw, self.since = 0, False, None, 0.0
 
-    def feed(self, tof, now):
-        """state.tof 한 샘플. 반환: 이번 호출로 +1 됐나."""
+    def feed(self, tof, now, direction=0):
+        """state.tof 한 샘플. 반환: 이번 호출로 반영된 증감 (+1 / 0 / -1).
+
+        `direction` 은 주행 방향(fwd_dir)이다. **차 밑 진입 순간의 방향이 부호를
+        정한다** — 전진이면 +1, 후진이면 -1, 정지(0)면 세지 않는다(사용자 지정).
+        차 밑/차 사이 판정 자체는 방향과 무관하게 진행한다 — 정지 중에도 화면의
+        "(차 밑)" 표시는 맞아야 하기 때문이다.
+        """
         cm = tof.get("dist_cm")
         # 🔴 **모름은 차 사이가 아니다.** 측정이 없는 샘플은 통째로 버린다 —
         #    직전 판정을 유지하고 유지시간 타이머도 건드리지 않는다.
@@ -106,17 +157,19 @@ class VehicleCounter:
         #    MQTT 가 그냥 늦게 오는 것은 이미 문제가 아니다 — feed 가 안 불릴 뿐이고
         #    raw 가 안 바뀌면 since 도 그대로라 유지시간이 계속 누적된다.
         if not tof.get("present") or cm is None or cm == 0:
-            return False
+            return 0
         raw = bool(tof.get("valid") and cm <= self.under_cm)
         if raw != self.raw:                       # 원시 판정이 바뀌면 타이머를 다시 잡는다
             self.raw, self.since = raw, now
         held = now - self.since
         if raw and not self.under and held >= self.under_hold:
-            self.under, self.n = True, self.n + 1
-            return True
+            self.under = True
+            # 대수는 음수가 될 수 없다 — 후진으로 0 아래로 내려가지 않게 막는다
+            self.n = max(0, self.n + direction)
+            return direction
         if not raw and self.under and held >= self.gap_hold:
             self.under = False
-        return False
+        return 0
 
     def text(self):
         """세 줄로 준다 — 아이콘 / 대수 / 상태.
@@ -330,69 +383,117 @@ def selftest():
     #    줄이자 통째로 깨졌다 — 값이 바뀌어도 **규칙**은 그대로여야 한다.
     U, G, E = UNDER_HOLD_S, GAP_HOLD_S, 0.05      # E = 경계 확인용 여유
     c = VehicleCounter()
-    assert c.feed(tof(80), 0.0) is False and c.n == 0                 # 차 사이
-    assert c.feed(tof(10), 1.0) is False and c.n == 0                 # 진입 — 유지시간 전
-    assert c.feed(tof(10), 1.0 + U - E) is False and c.n == 0
-    assert c.feed(tof(10), 1.0 + U) is True and c.n == 1              # 유지 충족 → +1
+    assert c.feed(tof(80), 0.0, 1) == 0 and c.n == 0                 # 차 사이
+    assert c.feed(tof(10), 1.0, 1) == 0 and c.n == 0                 # 진입 — 유지시간 전
+    assert c.feed(tof(10), 1.0 + U - E, 1) == 0 and c.n == 0
+    assert c.feed(tof(10), 1.0 + U, 1) == 1 and c.n == 1              # 유지 충족 → +1
     t = 1.0 + U
-    assert c.feed(tof(10), t + 5) is False and c.n == 1, "유지 중에 또 세면 안 된다"
+    assert c.feed(tof(10), t + 5, 1) == 0 and c.n == 1, "유지 중에 또 세면 안 된다"
     # 차 밑에서 값이 순간 튀어도 이탈시간을 못 넘기면 이탈이 아니다 → 이중계수 없음
-    assert c.feed(tof(80), t + 5 + G - E) is False and c.under is True
-    assert c.feed(tof(10), t + 6) is False and c.n == 1
-    assert c.feed(tof(10), t + 16) is False and c.n == 1, "재진입으로 세면 안 된다"
+    assert c.feed(tof(80), t + 5 + G - E, 1) == 0 and c.under is True
+    assert c.feed(tof(10), t + 6, 1) == 0 and c.n == 1
+    assert c.feed(tof(10), t + 16, 1) == 0 and c.n == 1, "재진입으로 세면 안 된다"
     # 이탈시간을 넘기면 차 사이 → 다음 대를 셀 준비
     t = t + 17
-    assert c.feed(tof(80), t) is False and c.under is True             # 타이머 시작
-    assert c.feed(tof(80), t + G) is False and c.under is False
-    assert c.feed(tof(10), t + G + 1) is False and c.n == 1
-    assert c.feed(tof(10), t + G + 1 + U) is True and c.n == 2, "두 번째 차"
+    assert c.feed(tof(80), t, 1) == 0 and c.under is True             # 타이머 시작
+    assert c.feed(tof(80), t + G, 1) == 0 and c.under is False
+    assert c.feed(tof(10), t + G + 1, 1) == 0 and c.n == 1
+    assert c.feed(tof(10), t + G + 1 + U, 1) == 1 and c.n == 2, "두 번째 차"
     assert (UNDER_HOLD_S, GAP_HOLD_S) == (2.0, 0.5), "사용자 지정 2초 / 0.5초"
 
     # 🔴 이번 버그: 2초를 세는 중에 0 cm(측정 실패) 이 섞여도 타이머가 리셋되면 안 된다.
     #    무선 지연·끊김에서 이게 들어와 차 밑인데도 안 세졌다 (2026-09-08).
     c6 = VehicleCounter()
-    assert c6.feed(tof(10), 0.0) is False                       # 진입 — 타이머 시작
+    assert c6.feed(tof(10), 0.0, 1) == 0                           # 진입 — 타이머 시작
     for t, bad in ((0.5, tof(0)), (0.9, tof(0, valid=False)),   # 강도 높음/낮음 둘 다
                    (1.2, tof(None)), (1.5, tof(5, present=False))):
-        assert c6.feed(bad, t) is False and c6.n == 0, (t, bad)
-    assert c6.feed(tof(10), U) is True and c6.n == 1, "0 때문에 타이머가 리셋됐다"
+        assert c6.feed(bad, t, 1) == 0 and c6.n == 0, (t, bad)   # 전진 중인데도
+    assert c6.feed(tof(10), U, 1) == 1 and c6.n == 1, "0 때문에 타이머가 리셋됐다"
 
     # 0 cm 은 허깨비 차량이 되어서도 안 된다 (강도가 높으면 `0 <= 20` 이 참이다)
     c7 = VehicleCounter()
     for t in (0.0, U, U * 2, U * 3):
-        assert c7.feed(tof(0), t) is False
+        assert c7.feed(tof(0), t, 1) == 0
     assert c7.n == 0 and c7.under is False, "0 cm 을 차 밑으로 셌다"
 
     # 모름이 이어지는 동안 직전 판정은 유지된다 — 차 밑이었으면 차 밑로 남는다
     c8 = VehicleCounter()
-    c8.feed(tof(10), 0.0)
-    assert c8.feed(tof(10), U) is True and c8.under is True
+    c8.feed(tof(10), 0.0, 1)
+    assert c8.feed(tof(10), U, 1) == 1 and c8.under is True
     for t in (U + 1, U + 9):
-        c8.feed(tof(0), t)
+        c8.feed(tof(0), t, 1)
     assert c8.under is True, "모름을 차 사이로 봤다"
 
     # 🔴 무효값은 절대 차 밑으로 세지 않는다 — false 면 작은 값이 튀어나올 수 있다
     c2 = VehicleCounter()
     for t in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0):
-        assert c2.feed(tof(5, valid=False), t) is False
+        assert c2.feed(tof(5, valid=False), t, 1) == 0
     assert c2.n == 0, "무효 거리값으로 허깨비 차량이 생겼다"
     for t in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0):
-        assert c2.feed(tof(5, present=False), t) is False
+        assert c2.feed(tof(5, present=False), t, 1) == 0
     assert c2.n == 0, "센서 없음도 차 밑이 아니다"
-    assert c2.feed(tof(None), 6.0) is False
+    assert c2.feed(tof(None), 6.0, 1) == 0
 
     # 경계값: 임계값 자체는 "이하" 라서 포함이다
     c3 = VehicleCounter()
-    c3.feed(tof(UNDER_CM), 0.0)
-    assert c3.feed(tof(UNDER_CM), U) is True, "임계값은 이하 = 차 밑"
+    c3.feed(tof(UNDER_CM), 0.0, 1)
+    assert c3.feed(tof(UNDER_CM), U, 1) == 1, "임계값은 이하 = 차 밑"
     c4 = VehicleCounter()
-    c4.feed(tof(UNDER_CM + 1), 0.0)
-    assert c4.feed(tof(UNDER_CM + 1), U + 1) is False and c4.n == 0
+    c4.feed(tof(UNDER_CM + 1), 0.0, 1)
+    assert c4.feed(tof(UNDER_CM + 1), U + 1, 1) == 0 and c4.n == 0
     assert UNDER_CM == 20.0, "사용자 지정 0.2 m"
     # 세 줄이어야 한다(아이콘 / 대수 / 상태). 줄 수가 흔들리면 하단 바 높이가 들썩인다
     for cc in (c3, c4, VehicleCounter()):
         assert cc.text().count("\n") == 2, cc.text()
     assert "차 밑" in c3.text() and "차 사이" in c4.text()
+
+    # ── 주행 방향 게이트 (2026-09-08) ──
+    # 🔴 vy 열은 vx·wz 열과 직교해야 한다. 아니면 게걸음·회전이 전진으로 새어든다.
+    MIX_VX, MIX_VY, MIX_WZ = (1, 1, 1, 1), (-1, 1, 1, -1), (-1, 1, -1, 1)
+    assert tuple(FWD_MIX) == tuple(float(v) for v in MIX_VY), "joy_teleop.MIX 의 vy 열이어야 한다"
+    for name, col in (("vx", MIX_VX), ("wz", MIX_WZ)):
+        assert sum(m * c for m, c in zip(FWD_MIX, col)) == 0, f"{name} 열과 직교해야 한다"
+
+    # 순수 전진/후진
+    assert fwd_dir([-4, 4, 4, -4]) == 1, "vy>0 = 물리적 전진"
+    assert fwd_dir([4, -4, -4, 4]) == -1
+    assert fwd_dir([0, 0, 0, 0]) == 0
+    # 게걸음·회전만 있으면 방향 없음 (직교의 결과)
+    assert fwd_dir([4, 4, 4, 4]) == 0, "코드상 vx(물리적 좌우)는 계수와 무관"
+    assert fwd_dir([-4, 4, -4, 4]) == 0, "제자리 회전은 계수와 무관"
+    # 각속도가 섞여도 선속도 부호로 판정한다 (사용자 지정)
+    assert fwd_dir([-4 - 3, 4 + 3, 4 - 3, -4 + 3]) == 1, "회전 섞인 전진"
+    assert fwd_dir([4 - 3, -4 + 3, -4 - 3, 4 + 3]) == -1, "회전 섞인 후진"
+    assert fwd_dir([-4 + 8, 4 + 8, 4 + 8, -4 + 8]) == 1, "게걸음 섞인 전진"
+    # 잡값·형식 오류는 방향 없음
+    for bad in (None, [], [1, 2, 3], [1, 2, 3, 4, 5], ["a", 0, 0, 0], [None] * 4):
+        assert fwd_dir(bad) == 0, bad
+    assert fwd_dir([0.1, -0.1, -0.1, 0.1]) == 0, "미세 잔여 지령은 무시(FWD_EPS_RPM)"
+
+    # 명령이 끊기면 정지로 본다
+    assert cmd_dir(1, 10.0, 10.5) == 1
+    assert cmd_dir(1, 10.0, 10.0 + CMD_STALE_S + 0.1) == 0, "낡은 명령은 정지"
+    assert cmd_dir(1, None, 10.0) == 0, "명령을 아직 못 받았으면 정지"
+
+    # 정지 중에는 세지 않지만 차 밑 표시는 맞아야 한다
+    c9 = VehicleCounter()
+    c9.feed(tof(10), 0.0, 0)
+    assert c9.feed(tof(10), U, 0) == 0 and c9.n == 0, "정지 중엔 노카운트"
+    assert c9.under is True, "정지 중에도 차 밑 표시는 맞아야 한다"
+
+    # 후진은 감소, 0 아래로는 안 내려간다
+    c10 = VehicleCounter()
+    c10.feed(tof(10), 0.0, 1)
+    assert c10.feed(tof(10), U, 1) == 1 and c10.n == 1
+    c10.feed(tof(80), U + 1, 1)
+    assert c10.feed(tof(80), U + 1 + G, 1) == 0 and c10.under is False
+    c10.feed(tof(10), U + 3, -1)
+    assert c10.feed(tof(10), U + 3 + U, -1) == -1 and c10.n == 0, "후진은 감소"
+    c10.feed(tof(80), U * 3, -1)
+    c10.feed(tof(80), U * 3 + G, -1)
+    c10.feed(tof(10), U * 4, -1)
+    c10.feed(tof(10), U * 4 + U, -1)
+    assert c10.n == 0, "0 아래로 내려가면 안 된다"
     # 첫 줄은 **항상 고정** — 대수·상태와 무관해야 한다(폭이 변하면 바가 흔들린다)
     c5 = VehicleCounter()
     for n, under in ((0, False), (3, False), (3, True), (99, True)):
@@ -729,6 +830,7 @@ def main():
     lift_block = {"txt": ""}        # crevis-io 가 알려주는 리프트 막힘 사유
     warn_state = {"txt": ""}        # 로봇 state 에서 온 경고
     counter = VehicleCounter(a.under_cm, a.under_hold, a.gap_hold)
+    cmd = {"dir": 0, "at": None}    # 마지막 구동 명령의 물리적 전진 방향과 시각
 
     def show_count():
         """차 밑이면 초록(#count_under), 차 사이면 노랑(#count). 이름을 바꿔 끼운다."""
@@ -832,7 +934,12 @@ def main():
     def on_connect(c, _u, _f, rc):
         c.subscribe([(f"{a.prefix}/state", 0), (f"{a.prefix}/event", 1),
                      (f"{a.prefix}/alarm/#", 1), (f"{a.prefix}/state/online", 1),
-                     (f"{a.prefix}/frame/thermal", 0), (a.lift_block_topic, 1)])
+                     (f"{a.prefix}/frame/thermal", 0), (a.lift_block_topic, 1),
+                     # 차량 계수의 방향 게이트용 — teleop 이 보내는 구동 명령을 엿본다.
+                     # state 의 휠 피드백을 쓰지 않는 이유: 그건 **실제 회전**이라
+                     # 명령 없이 도는 유령 회전까지 세고, 무선이 밀리면 낡은 값이 온다.
+                     # 조종자의 의도를 세려면 명령을 봐야 한다.
+                     (f"{a.prefix}/cmd/wheel", 1), (f"{a.prefix}/cmd/stop", 1)])
         # 프레임 발행은 기본 꺼져 있다 — 켜야 frame/thermal 이 온다
         c.publish(f"{a.prefix}/cmd/stream", json.dumps({"on": True, "fps": a.thermal_fps}), qos=1)
         # 접속할 때마다 무조건 잠금부터 발행한다 — 기본값이 안전이어야 한다
@@ -875,13 +982,24 @@ def main():
             d = json.loads(msg.payload)
         except ValueError:
             return
+        # ── 구동 명령 엿보기 → 차량 계수의 방향 게이트
+        if sub == "cmd/wheel":
+            cmd["dir"], cmd["at"] = fwd_dir(d.get("rpm")), time.monotonic()
+            return
+        if sub == "cmd/stop":
+            cmd["dir"], cmd["at"] = 0, time.monotonic()
+            return
+
         if sub == "state":
             # ── 차량 카운터는 **리셋 경로가 없다** (2026-09-08 사용자 지정).
             #    e-stop 해제로 0 이 되게 했었는데, e-stop 은 카운트와 무관한 이유로도
             #    걸리니 해제할 때마다 누적이 날아갔다. 0 은 **물리 리셋 버튼**으로 만든다
             #    (crevis_io 가 navi-console 을 재시작한다).
-            if counter.feed(d.get("tof") or {}, time.monotonic()):
-                print(f"[차량] {counter.n}대 통과", flush=True)
+            now = time.monotonic()
+            delta = counter.feed(d.get("tof") or {}, now,
+                                 cmd_dir(cmd["dir"], cmd["at"], now))
+            if delta:
+                print(f"[차량] {delta:+d} → {counter.n}대 통과", flush=True)
             GLib.idle_add(show_count)
 
             drive, sensor, warn = fmt_state(d)
