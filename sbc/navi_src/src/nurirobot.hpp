@@ -132,6 +132,24 @@ public:
     Bus(const Bus&) = delete;
     Bus& operator=(const Bus&) = delete;
 
+    // 🔴 응답이 **없는** 제어 명령(속도·정지)끼리의 최소 간격.
+    //
+    // 왜 kMinGap(12ms) 이 아닌가: 문서 §7.2 의 10ms 규칙은 "연속 **요청**" 에 대한
+    // 것이고 목적은 **응답을 흘리지 않는 것**이다(아래 send() 주석의 실측이 그 경우다).
+    // 속도명령(0x03)·정지(Open-loop)는 응답 자체가 없어 그 이유가 성립하지 않는다.
+    // 근거: tools/nuri_spin.py 는 간격 규칙이 없는 파이썬 Bus 로 속도명령을 연달아
+    //       보내며 4축을 정상 구동해 왔다(프레임당 ~1.2ms).
+    //
+    // 왜 고쳤나: 4축에 순차로 보내면 12ms × 3 = **36ms** 가 어긋나고, 그 사이 부호가
+    // 엇갈린 부분 집합이 **회전 모멘트**를 만들어 출발할 때 차체가 틀어졌다(4.26장).
+    // 2ms 면 편차가 6ms 로 준다. 프레임 전송 자체가 ~1.2ms 라 더 줄일 여지는 작다.
+    //
+    // ⚠️ 폴링·핑처럼 **응답을 읽는 경로는 반드시 kMinGap 을 쓴다.** 빠른 명령 직후
+    //    폴링이 와도 그 앞에서 12ms 를 다시 채우므로 원래 보호는 그대로다.
+    static constexpr Ms kWriteGap{2};
+
+    // gap: **이번에 보낼 것** 앞에 두어야 할 최소 간격. 직전에 무엇을 보냈느냐가 아니라
+    //      지금 무엇을 보내느냐로 정해진다 — 응답을 기다릴 거면 길게, 아니면 짧게.
     // 제어·설정 명령은 응답이 없다. 송신만 하고 즉시 반환.
     //
     // DE를 내리는 시점이 이 드라이버의 핵심이다 (실측):
@@ -139,11 +157,11 @@ public:
     //   TIOCOUTQ==0 은 FIFO로 넘어간 시점일 뿐   → 4.4ms 일러서 송신이 잘림
     // 그래서 둘 다 쓰지 않고 전송 시작 시각 + 이론 전송시간(10비트/바이트)으로 계산한다.
     // 9600에서 guard 100~500µs가 안전 구간, 800µs부터 응답 첫 바이트가 잘린다.
-    void send(const std::vector<uint8_t>& pkt) {
+    void send(const std::vector<uint8_t>& pkt, Ms gap = kMinGap) {
         // 문서 7.2: 연속 요청은 10ms 이상 간격. 붙여 보내면 응답을 흘린다
         // (실측: Ping 직후 바로 감속비를 물으면 무응답).
         const auto since = Clock::now() - last_tx_;
-        if (since < kMinGap) std::this_thread::sleep_for(kMinGap - since);
+        if (since < gap) std::this_thread::sleep_for(gap - since);
 
         flushInput();
         if (de_) gpiod_line_set_value(de_, 1);
@@ -236,7 +254,7 @@ private:
         return false;
     }
 
-    static constexpr Ms kMinGap{12};   // 문서 요구 10ms + 여유
+    static constexpr Ms kMinGap{12};   // 문서 요구 10ms + 여유. **응답을 기다리는 요청**용
 
     int fd_ = -1, baud_;
     double guard_;
@@ -387,8 +405,9 @@ public:
 private:
     static constexpr Ms kCmdSettle{250};   // 명령 후 이 시간 동안의 피드백은 버린다
 
+    // 응답 없는 제어 명령이 전부 여기를 지난다 → 짧은 간격은 이 한 곳에서만 쓴다.
     void sendWith(uint8_t mode, const std::vector<uint8_t>& v) {
-        bus_.send(frame(id_, mode, v.data(), v.size()));
+        bus_.send(frame(id_, mode, v.data(), v.size()), Bus::kWriteGap);
     }
 
     static uint16_t clamp16(double x, uint16_t lo = 0, uint16_t hi = 0xFFFD) {

@@ -118,7 +118,23 @@ public:
     // ── ① 축별 속도 — 차체 치수 없이도 쓸 수 있다 ──────────────
     // rpm은 출력축 기준, 전진이 +. Config::wheels[].sign으로 좌우 방향을 뒤집는다.
     void setWheelRpm(const WheelRpm& rpm, double ramp_s = 0.5) {
-        for (size_t i = 0; i < motors_.size(); ++i) {
+        // 🔴 **대각선 먼저** 보낸다 (FL → RR → FR → RL). 반이중 버스라 4축이 동시에
+        //    출발할 수 없고, 명령이 하나씩 들어가는 동안의 **부분 집합**이 짝이 안 맞으면
+        //    알짜 회전 모멘트가 생겨 출발할 때 차체가 틀어진다(핸드오프 4.26).
+        //
+        //    yaw ∝ rpm·wz열,  wz열 = (-1, +1, -1, +1) = (FL, FR, RL, RR)
+        //    순수 전진/게걸음에서 대각(FL·RR, FR·RL)은 wz 기여가 **서로 상쇄**한다:
+        //
+        //      기존 FL→FR→RL→RR :  +c → +2c → +c → 0     (최대 2c, 36ms 내내 불균형)
+        //      지금 FL→RR→FR→RL :  +c →  0  → +c → 0     (최대 c, 중간에 한 번 균형)
+        //
+        //    ⚠️ 순서를 바꿔도 **보내는 값은 그대로**다. 늦게 받는 축이 늦게 출발하는 건
+        //       남으므로(kWriteGap 으로 36→6ms 로 줄였다) 이건 그 위의 보강이다.
+        //    ⚠️ 색인은 곧 배치다 — 0=FL 1=FR 2=RL 3=RR (config.hpp 의 wheels 순서).
+        //       축 수가 4 미만인 구성도 있어 범위를 넘으면 건너뛴다.
+        static constexpr size_t kDiagOrder[4] = {0, 3, 1, 2};
+        for (const size_t i : kDiagOrder) {
+            if (i >= motors_.size()) continue;
             const double v = clampRpm(rpm[i]) * cfg_.wheels[i].sign;
             if (std::fabs(v) < 0.05) motors_[i].stop();   // 0은 규격 밖 → 출력 차단으로 처리
             else motors_[i].setSpeed(v, ramp_s);
