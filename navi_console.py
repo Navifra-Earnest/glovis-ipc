@@ -62,10 +62,16 @@ def guide_tick_xs(y):
 # 판정 기준은 사용자 지정(2026-09-02):
 #
 #   0.2 m 이하가 2초 유지     → +1대
-#   그 이상이 0.5초 이상 유지 → 차 사이 통과 중 = 다음 대를 셀 준비
+#   그 이상이 0.2초 이상 유지 → 차 사이 통과 중 = 다음 대를 셀 준비
 #
-# 3초/1초 → 2초/0.5초 (2026-09-08 사용자 변경): 차량이 촘촘히 서 있으면 차 사이를
-# 1초 안에 지난다. ToF 데이터가 일정하게 들어오는 게 확인돼서 두 값을 같이 줄였다.
+# 3초/1초 → 2초/0.5초 (2026-09-08) → 이탈 0.2초 (2026-09-30, 사용자 지정).
+# 차량이 촘촘히 서 있으면 차 사이를 1초 안에 지난다. ToF 가 일정하게 들어와서 줄였다.
+#
+# ⚠️ **이탈 0.2초는 샘플 한 개가 판정을 결정하는 값이다.** `state` 는 주행 중 5 Hz
+#    (200 ms)라 전이 직후 첫 샘플에서 바로 임계를 넘긴다. 차 밑에서 값이 한 번만 튀어도
+#    "차 사이" 가 되고, 다시 들어오며 **같은 차를 두 번 셀 수 있다.**
+#    두 번 세는 게 보이면 이 값을 도로 올린다 — 차 사이 통과에는 여유가 많다
+#    (최소 간격 110 mm 를 최고속 0.05 m/s 로 지나도 2.2초. → 핸드오프 4.25장)
 #
 # 🔴 `under` 은 **valid 를 반드시 본다.** `valid` 는 신호강도 판정이고 false 면 거리값이
 #    쓰레기라 작은 값이 튀어나올 수 있다(fmt_state 주석 참고) — 그걸 "차 밑" 으로 세면
@@ -79,7 +85,7 @@ def guide_tick_xs(y):
 # 올려도 차 사이 판정은 안 망가진다 — 판정식이 `valid 하고 임계 이하` 라서 무효는
 # 임계와 무관하게 차 사이다.
 # ⚠️ 차 사이인데도 차 밑으로 세면 내리면 된다: --under-cm 20
-UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 40.0, 2.0, 0.5
+UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 40.0, 2.0, 0.2
 ICONS = "🚗 🚗"       # 첫 줄 고정. 대수·상태와 무관하게 그대로 둔다(사용자 지정)
 
 # ── 주행 방향 게이트 (2026-09-08 사용자 지정) ────────────────────────────
@@ -129,7 +135,7 @@ def cmd_dir(d, at, now, stale=CMD_STALE_S):
 
 
 class VehicleCounter:
-    """지나간 차량 수. 히스테리시스(진입 2초 / 이탈 0.5초)로 튐과 이중계수를 막는다.
+    """지나간 차량 수. 히스테리시스(진입 2초 / 이탈 0.2초)로 튐과 이중계수를 막는다.
 
     이탈에 시간을 요구하는 이유: 차 밑에서 거리값이 순간 튀어도(배선·요철) 차에서
     나온 것으로 보지 않는다. 그래서 한 대를 두 번 세지 않는다.
@@ -479,13 +485,17 @@ def selftest():
 
     # 🔴 시각을 상수에서 계산한다. 예전엔 3초·1초를 그대로 박아뒀다가 임계를 2초·0.5초로
     #    줄이자 통째로 깨졌다 — 값이 바뀌어도 **규칙**은 그대로여야 한다.
-    U, G, E = UNDER_HOLD_S, GAP_HOLD_S, 0.05      # E = 경계 확인용 여유
+    # E = 경계 앞뒤로 두는 여유. 🔴 **경계를 정확히 찌르지 않는다** — `t + G` 처럼 딱
+    #    맞춰 부르면 부동소수점 표현에 좌우된다(20.2 - 20.0 = 0.19999999999999929 이라
+    #    G=0.2 에서 미끄러진다. G=0.5 일 땐 우연히 통과했다). 검증할 규칙은
+    #    "유지시간 전에는 안 바뀌고, 지나면 바뀐다" 이므로 앞뒤로 E 를 둔다.
+    U, G, E = UNDER_HOLD_S, GAP_HOLD_S, 0.05
     c = VehicleCounter()
     assert c.feed(tof(80), 0.0, 1) == 0 and c.n == 0                 # 차 사이
     assert c.feed(tof(10), 1.0, 1) == 0 and c.n == 0                 # 진입 — 유지시간 전
     assert c.feed(tof(10), 1.0 + U - E, 1) == 0 and c.n == 0
-    assert c.feed(tof(10), 1.0 + U, 1) == 1 and c.n == 1              # 유지 충족 → +1
-    t = 1.0 + U
+    assert c.feed(tof(10), 1.0 + U + E, 1) == 1 and c.n == 1          # 유지 충족 → +1
+    t = 1.0 + U + E
     assert c.feed(tof(10), t + 5, 1) == 0 and c.n == 1, "유지 중에 또 세면 안 된다"
     # 차 밑에서 값이 순간 튀어도 이탈시간을 못 넘기면 이탈이 아니다 → 이중계수 없음
     assert c.feed(tof(80), t + 5 + G - E, 1) == 0 and c.under is True
@@ -494,10 +504,10 @@ def selftest():
     # 이탈시간을 넘기면 차 사이 → 다음 대를 셀 준비
     t = t + 17
     assert c.feed(tof(80), t, 1) == 0 and c.under is True             # 타이머 시작
-    assert c.feed(tof(80), t + G, 1) == 0 and c.under is False
+    assert c.feed(tof(80), t + G + E, 1) == 0 and c.under is False
     assert c.feed(tof(10), t + G + 1, 1) == 0 and c.n == 1
-    assert c.feed(tof(10), t + G + 1 + U, 1) == 1 and c.n == 2, "두 번째 차"
-    assert (UNDER_HOLD_S, GAP_HOLD_S) == (2.0, 0.5), "사용자 지정 2초 / 0.5초"
+    assert c.feed(tof(10), t + G + 1 + U + E, 1) == 1 and c.n == 2, "두 번째 차"
+    assert (UNDER_HOLD_S, GAP_HOLD_S) == (2.0, 0.2), "사용자 지정 2초 / 0.2초"
 
     # 🔴 이번 버그: 2초를 세는 중에 0 cm(측정 실패) 이 섞여도 타이머가 리셋되면 안 된다.
     #    무선 지연·끊김에서 이게 들어와 차 밑인데도 안 세졌다 (2026-09-08).
@@ -506,7 +516,7 @@ def selftest():
     for t, bad in ((0.5, tof(0)), (0.9, tof(0, valid=False)),   # 강도 높음/낮음 둘 다
                    (1.2, tof(None)), (1.5, tof(5, present=False))):
         assert c6.feed(bad, t, 1) == 0 and c6.n == 0, (t, bad)   # 전진 중인데도
-    assert c6.feed(tof(10), U, 1) == 1 and c6.n == 1, "0 때문에 타이머가 리셋됐다"
+    assert c6.feed(tof(10), U + E, 1) == 1 and c6.n == 1, "0 때문에 타이머가 리셋됐다"
 
     # 0 cm 은 허깨비 차량이 되어서도 안 된다 (강도가 높으면 `0 <= 20` 이 참이다)
     c7 = VehicleCounter()
@@ -517,7 +527,7 @@ def selftest():
     # 모름이 이어지는 동안 직전 판정은 유지된다 — 차 밑이었으면 차 밑로 남는다
     c8 = VehicleCounter()
     c8.feed(tof(10), 0.0, 1)
-    assert c8.feed(tof(10), U, 1) == 1 and c8.under is True
+    assert c8.feed(tof(10), U + E, 1) == 1 and c8.under is True
     for t in (U + 1, U + 9):
         c8.feed(tof(0), t, 1)
     assert c8.under is True, "모름을 차 사이로 봤다"
@@ -578,13 +588,13 @@ def selftest():
     # 정지 중에는 세지 않지만 차 밑 표시는 맞아야 한다
     c9 = VehicleCounter()
     c9.feed(tof(10), 0.0, 0)
-    assert c9.feed(tof(10), U, 0) == 0 and c9.n == 0, "정지 중엔 노카운트"
+    assert c9.feed(tof(10), U + E, 0) == 0 and c9.n == 0, "정지 중엔 노카운트"
     assert c9.under is True, "정지 중에도 차 밑 표시는 맞아야 한다"
 
     # 후진은 감소, 0 아래로는 안 내려간다
     c10 = VehicleCounter()
     c10.feed(tof(10), 0.0, 1)
-    assert c10.feed(tof(10), U, 1) == 1 and c10.n == 1
+    assert c10.feed(tof(10), U + E, 1) == 1 and c10.n == 1
     c10.feed(tof(80), U + 1, 1)
     assert c10.feed(tof(80), U + 1 + G, 1) == 0 and c10.under is False
     c10.feed(tof(10), U + 3, -1)
