@@ -62,7 +62,7 @@ def guide_tick_xs(y):
 # 판정 기준은 사용자 지정(2026-09-02):
 #
 #   0.2 m 이하가 2초 유지     → +1대
-#   그 이상이 0.2초 이상 유지 → 차 사이 통과 중 = 다음 대를 셀 준비
+#   그 이상이 **한 샘플만 들어와도 즉시** → 차 사이 통과 중 = 다음 대를 셀 준비
 #
 # 3초/1초 → 2초/0.5초 (2026-09-08) → 이탈 0.2초 (2026-09-30, 사용자 지정).
 # 차량이 촘촘히 서 있으면 차 사이를 1초 안에 지난다. ToF 가 일정하게 들어와서 줄였다.
@@ -85,7 +85,7 @@ def guide_tick_xs(y):
 # 올려도 차 사이 판정은 안 망가진다 — 판정식이 `valid 하고 임계 이하` 라서 무효는
 # 임계와 무관하게 차 사이다.
 # ⚠️ 차 사이인데도 차 밑으로 세면 내리면 된다: --under-cm 20
-UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 40.0, 2.0, 0.2
+UNDER_CM, UNDER_HOLD_S, GAP_HOLD_S = 40.0, 2.0, 0.0
 ICONS = "🚗 🚗"       # 첫 줄 고정. 대수·상태와 무관하게 그대로 둔다(사용자 지정)
 
 # ── 주행 방향 게이트 (2026-09-08 사용자 지정) ────────────────────────────
@@ -135,7 +135,7 @@ def cmd_dir(d, at, now, stale=CMD_STALE_S):
 
 
 class VehicleCounter:
-    """지나간 차량 수. 히스테리시스(진입 2초 / 이탈 0.2초)로 튐과 이중계수를 막는다.
+    """지나간 차량 수. 진입에만 유지시간(2초)을 요구하고 **이탈은 즉시** 판정한다.
 
     이탈에 시간을 요구하는 이유: 차 밑에서 거리값이 순간 튀어도(배선·요철) 차에서
     나온 것으로 보지 않는다. 그래서 한 대를 두 번 세지 않는다.
@@ -338,8 +338,12 @@ def fmt_state(d):
         warn.append(f"E-STOP 래치: {d.get('estop_reason') or '사유 없음'} — 해제 버튼으로만 풀린다")
     if not d.get("drive_ok"):
         warn.append(d.get("drive_error") or "구동계 없음")
-    if tof.get("present") and not tof.get("valid"):
-        warn.append("거리값 신뢰 불가 — 장애물 판단에 쓰지 말 것")
+    # 🔴 거리 무효는 **빨간 경고에 넣지 않는다** (2026-09-30 사용자 지적: "너무 자주 뜬다").
+    #    워치독 때와 같은 이유다 — **평상시가 무효 상태**라 정보가 0인데 빨간 글씨라
+    #    계속 신경 쓰인다. 실측(40초, 차 밖): **무효 100%, 강도 26~46**(임계 100).
+    #    위가 트여 있으면 반사할 것이 없어 약하게 오는 게 정상이다. 차 밑에 들어가야
+    #    강도가 올라간다 — 즉 `valid` 는 고장 신호가 아니라 **차 밑/밖 판별 신호**에 가깝다.
+    #    정보는 안 사라진다: 센서 줄이 `거리 무효(강도 38)` 로 항상 보여준다.
     return drive, sensor, " / ".join(warn)
 
 
@@ -438,10 +442,16 @@ def selftest():
                          "tof": {"dist_cm": 999, "strength": 12, "valid": False, "present": True}})
     assert "구동 X" in d and "축 없음" in d, d
     assert "무효" in s and "999" not in s, s    # valid:false → 거리 숫자를 아예 안 띄운다
-    assert "과전류 6.2A" in w and "휠 FR" in w and "신뢰 불가" in w, w
+    assert "과전류 6.2A" in w and "휠 FR" in w
+    assert "신뢰 불가" not in w, "거리 무효는 빨간 경고에 안 넣는다 (센서 줄이 말한다)"
 
     _, s, w = fmt_state({"tof": {"present": False}})
     assert "센서없음" in s and "신뢰 불가" not in w, (s, w)   # 없는 센서로 경고를 띄우진 않는다
+    # 무효일 때 숫자를 감추고 강도를 보여주는 건 **센서 줄**의 책임이다
+    inval = fmt_state({"drive_ok": True,
+                       "tof": {"present": True, "valid": False, "dist_cm": 7, "strength": 38}})
+    assert "무효" in inval[1] and "38" in inval[1] and "7" not in inval[1].split("열화상")[0]
+    assert inval[2] == "", "무효만으로는 경고가 없어야 한다"
 
     assert fmt_state({})[0] == "구동 X · 0축 · 축 없음"      # 빈 state 로도 안 죽는다
 
@@ -489,7 +499,7 @@ def selftest():
     #    맞춰 부르면 부동소수점 표현에 좌우된다(20.2 - 20.0 = 0.19999999999999929 이라
     #    G=0.2 에서 미끄러진다. G=0.5 일 땐 우연히 통과했다). 검증할 규칙은
     #    "유지시간 전에는 안 바뀌고, 지나면 바뀐다" 이므로 앞뒤로 E 를 둔다.
-    U, G, E = UNDER_HOLD_S, GAP_HOLD_S, 0.05
+    U, E = UNDER_HOLD_S, 0.05
     c = VehicleCounter()
     assert c.feed(tof(80), 0.0, 1) == 0 and c.n == 0                 # 차 사이
     assert c.feed(tof(10), 1.0, 1) == 0 and c.n == 0                 # 진입 — 유지시간 전
@@ -497,17 +507,27 @@ def selftest():
     assert c.feed(tof(10), 1.0 + U + E, 1) == 1 and c.n == 1          # 유지 충족 → +1
     t = 1.0 + U + E
     assert c.feed(tof(10), t + 5, 1) == 0 and c.n == 1, "유지 중에 또 세면 안 된다"
-    # 차 밑에서 값이 순간 튀어도 이탈시간을 못 넘기면 이탈이 아니다 → 이중계수 없음
-    assert c.feed(tof(80), t + 5 + G - E, 1) == 0 and c.under is True
-    assert c.feed(tof(10), t + 6, 1) == 0 and c.n == 1
-    assert c.feed(tof(10), t + 16, 1) == 0 and c.n == 1, "재진입으로 세면 안 된다"
-    # 이탈시간을 넘기면 차 사이 → 다음 대를 셀 준비
-    t = t + 17
-    assert c.feed(tof(80), t, 1) == 0 and c.under is True             # 타이머 시작
-    assert c.feed(tof(80), t + G + E, 1) == 0 and c.under is False
-    assert c.feed(tof(10), t + G + 1, 1) == 0 and c.n == 1
-    assert c.feed(tof(10), t + G + 1 + U + E, 1) == 1 and c.n == 2, "두 번째 차"
-    assert (UNDER_HOLD_S, GAP_HOLD_S) == (2.0, 0.2), "사용자 지정 2초 / 0.2초"
+
+    # ── 이탈은 **즉시**다 (2026-09-30 사용자 지정). 타이머를 안 잰다.
+    assert c.feed(tof(80), t + 6, 1) == 0 and c.under is False, "한 샘플로 바로 이탈"
+    # 다음 대는 다시 2초를 채워야 세어진다 — 진입 쪽 보호는 그대로다
+    assert c.feed(tof(10), t + 7, 1) == 0 and c.n == 1
+    assert c.feed(tof(10), t + 7 + U - E, 1) == 0 and c.n == 1
+    assert c.feed(tof(10), t + 7 + U + E, 1) == 1 and c.n == 2, "두 번째 차"
+
+    # 🔴 **이 설정이 감수하는 대가를 명시한다.** 이탈에 유지시간이 없으므로 차 밑에서
+    #    값이 한 번만 튀어도 이탈로 보고, 2초 뒤 **같은 차를 또 센다.** 예전 0.5초
+    #    히스테리시스가 막아주던 것이다. 대수가 부풀면 `--gap-hold` 를 올리면 된다.
+    c0 = VehicleCounter()
+    c0.feed(tof(10), 0.0, 1)
+    assert c0.feed(tof(10), U + E, 1) == 1 and c0.n == 1
+    c0.feed(tof(80), 10.0, 1)                       # 차 밑인데 한 샘플만 튐
+    assert c0.under is False, "즉시 이탈 — 의도한 동작이다"
+    c0.feed(tof(10), 10.2, 1)                       # 곧바로 다시 차 밑
+    assert c0.feed(tof(10), 10.2 + U + E, 1) == 1 and c0.n == 2, \
+        "같은 차를 두 번 센다 — 즉시 이탈의 알려진 대가다"
+
+    assert (UNDER_HOLD_S, GAP_HOLD_S) == (2.0, 0.0), "사용자 지정: 진입 2초 / 이탈 즉시"
 
     # 🔴 이번 버그: 2초를 세는 중에 0 cm(측정 실패) 이 섞여도 타이머가 리셋되면 안 된다.
     #    무선 지연·끊김에서 이게 들어와 차 밑인데도 안 세졌다 (2026-09-08).
@@ -595,14 +615,12 @@ def selftest():
     c10 = VehicleCounter()
     c10.feed(tof(10), 0.0, 1)
     assert c10.feed(tof(10), U + E, 1) == 1 and c10.n == 1
-    c10.feed(tof(80), U + 1, 1)
-    assert c10.feed(tof(80), U + 1 + G, 1) == 0 and c10.under is False
+    assert c10.feed(tof(80), U + 1, 1) == 0 and c10.under is False   # 이탈 즉시
     c10.feed(tof(10), U + 3, -1)
-    assert c10.feed(tof(10), U + 3 + U, -1) == -1 and c10.n == 0, "후진은 감소"
+    assert c10.feed(tof(10), U + 3 + U + E, -1) == -1 and c10.n == 0, "후진은 감소"
     c10.feed(tof(80), U * 3, -1)
-    c10.feed(tof(80), U * 3 + G, -1)
     c10.feed(tof(10), U * 4, -1)
-    c10.feed(tof(10), U * 4 + U, -1)
+    c10.feed(tof(10), U * 4 + U + E, -1)
     assert c10.n == 0, "0 아래로 내려가면 안 된다"
     # 첫 줄은 **항상 고정** — 대수·상태와 무관해야 한다(폭이 변하면 바가 흔들린다)
     c5 = VehicleCounter()
