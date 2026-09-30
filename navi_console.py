@@ -10,7 +10,7 @@ GTK3 + GStreamer(gtksink) + paho-mqtt. 전부 IPC 에 이미 있는 것만 쓴�
 ⚠️ 조이스틱 주행은 이 프로세스가 아니라 joy_teleop.py 가 담당한다. 일부러 분리했다 —
    구동 명령은 350ms 케이던스를 지켜야 하는데 GUI 렌더링에 막히면 워치독이 로봇을 세운다.
 """
-import argparse, json, os, sys, threading, time
+import argparse, json, os, signal, sys, threading, time
 
 import mqtt_link
 
@@ -188,6 +188,96 @@ class VehicleCounter:
         """
         return (f"{ICONS}\n{self.n}대 통과\n"
                 f"{'(차 밑)' if self.under else '(차 사이)'}")
+
+
+# ── 화면 녹화 (GNOME Shell 내장 스크린캐스트) ─────────────────────────────
+# 🔴 **`ffmpeg -f x11grab` 은 안 된다.** IPC 는 Wayland 세션이다(GNOME 46) — 실측에서
+#    `Cannot open display :0` 로 실패했다. XWayland 루트에는 Wayland 네이티브 창이
+#    합성되지 않는다. GNOME 의 `org.gnome.Shell.Screencast` D-Bus 가 플랫폼 기본
+#    수단이고, 포털 대화상자 없이 바로 녹화된다. 새 의존성도 없다.
+#    (gst 로 하려 해도 이 기계엔 x264enc·vaapi 인코더가 없다 — 확인함)
+#
+# 🔴 **호출한 D-Bus 연결이 살아 있는 동안만 녹화된다.** `gdbus call` 로 시험했더니
+#    48바이트 빈 파일이 나왔고 로그에 이렇게 찍혔다:
+#        Screencast failed during phase RECORDING: RecorderError: **Sender has vanished**
+#    `gdbus call` 은 응답 받고 바로 죽으니까 GNOME 이 녹화를 접은 것이다.
+#    콘솔처럼 계속 떠 있는 프로세스에서 부르면 정상이다(실측 6초 458KB · h264 15fps).
+#    → 그래서 프록시를 **인스턴스에 보관**한다. 지역변수로 두면 GC 되며 녹화가 끊긴다.
+#
+# 🔴 **파일명은 GNOME 이 정한다.** 확장자를 붙여 주면 하나 더 붙인다(`x.mp4`→`x.mp4.mp4`).
+#    확장자 없이 주고 **반환된 이름을 쓴다.**
+REC_DIR, REC_FPS = "~/navifra/recordings", 15
+
+
+def rec_label(secs):
+    """녹화 버튼 라벨. secs=None 이면 대기, 숫자면 녹화 중 경과시간.
+
+    순수 함수라 selftest 로 검증한다 — 화면에서 이 글자가 녹화 여부의 유일한 단서다.
+    """
+    if secs is None:
+        return "⏺ 녹화"
+    m, sec = divmod(max(0, int(secs)), 60)
+    return f"⏹ {m}:{sec:02d}"
+
+
+class Recorder:
+    """GNOME 스크린캐스트 토글. 한 번 누르면 시작, 다시 누르면 중지.
+
+    D-Bus 가 없거나(GNOME 아님) 실패해도 **예외를 밖으로 던지지 않는다** — 녹화는
+    보조 기능이고, 이것 때문에 조종 화면이 죽으면 안 된다. 사유만 문자열로 돌려준다.
+    """
+
+    def __init__(self):
+        self.proxy = None          # 🔴 보관해야 한다 (위 주석)
+        self.path = None           # 녹화 중이면 GNOME 이 알려준 실제 파일명
+        self.t0 = None
+
+    @property
+    def on(self):
+        return self.path is not None
+
+    def _call(self, method, args=None):
+        from gi.repository import Gio, GLib
+        if self.proxy is None:
+            self.proxy = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
+                "org.gnome.Shell.Screencast", "/org/gnome/Shell/Screencast",
+                "org.gnome.Shell.Screencast", None)
+        return self.proxy.call_sync(method, args, Gio.DBusCallFlags.NONE, 5000, None).unpack()
+
+    def start(self, now):
+        """→ (성공?, 사람에게 보여줄 문구)"""
+        from gi.repository import GLib
+        try:
+            d = os.path.expanduser(REC_DIR)
+            os.makedirs(d, exist_ok=True)
+            # 확장자를 빼고 준다 — GNOME 이 붙인다
+            tmpl = os.path.join(d, time.strftime("navi-%Y%m%d-%H%M%S"))
+            ok, name = self._call("Screencast", GLib.Variant("(sa{sv})", (tmpl, {
+                "framerate": GLib.Variant("i", REC_FPS),
+                "draw-cursor": GLib.Variant("b", False)})))
+            if not ok:
+                return False, "녹화 시작 실패 — GNOME 이 거부했다"
+            self.path, self.t0 = name, now
+            return True, f"녹화 시작 · {os.path.basename(name)}"
+        except Exception as e:                      # D-Bus 없음·권한·이름 없음 전부
+            self.proxy = None                       # 다음에 다시 만들어 본다
+            return False, f"녹화 불가: {e}"
+
+    def stop(self):
+        """→ (성공?, 문구). 이미 멈춰 있으면 조용히 성공으로 본다."""
+        if not self.on:
+            return True, ""
+        name, self.path, self.t0 = self.path, None, None
+        try:
+            self._call("StopScreencast")
+        except Exception as e:
+            return False, f"녹화 중지 실패: {e}"
+        size = os.path.getsize(name) if os.path.exists(name) else 0
+        return True, f"녹화 저장 · {os.path.basename(name)} ({size / 1e6:.1f} MB)"
+
+    def elapsed(self, now):
+        return None if self.t0 is None else now - self.t0
 
 
 def notice_stale(until, now):
@@ -516,6 +606,23 @@ def selftest():
     # 리셋 경로는 없앴다(2026-09-08) — 카운터를 0 으로 만드는 조작이 없어야 한다
     assert not hasattr(c, "reset"), "e-stop 해제로 카운터가 0 이 되면 안 된다"
 
+    # ── 녹화 버튼 라벨 (화면에서 녹화 여부의 유일한 단서다) ──
+    assert rec_label(None) == "⏺ 녹화"
+    assert rec_label(0) == "⏹ 0:00"
+    assert rec_label(9.9) == "⏹ 0:09", "내림이어야 한다 — 안 지난 초를 세면 안 된다"
+    assert rec_label(60) == "⏹ 1:00"
+    assert rec_label(125) == "⏹ 2:05"
+    assert rec_label(3725) == "⏹ 62:05", "시간 단위는 안 쓴다 — 분으로 계속 센다"
+    assert rec_label(-1) == "⏹ 0:00", "음수는 0 으로"
+    # 대기/녹화중 글자가 달라야 한다 (같으면 눌렀는지 알 수 없다)
+    assert rec_label(None) != rec_label(0)
+
+    r = Recorder()
+    assert r.on is False and r.elapsed(100.0) is None
+    r.path, r.t0 = "/tmp/x.mp4", 100.0          # 시작한 척
+    assert r.on is True and r.elapsed(163.0) == 63.0
+    assert rec_label(r.elapsed(163.0)) == "⏹ 1:03"
+
     # event 알림 만료: None 은 영구(접속 상태), 숫자는 그 시각 이후 사라진다
     assert notice_stale(None, 1e9) is False, "None 은 만료시키지 않는다"
     assert notice_stale(100.0, 99.9) is False
@@ -827,6 +934,10 @@ def main():
                         color: #2ecc40; padding: 0 14px; }}
         button {{ font-size: {a.font_pt * 2}pt; font-weight: bold;
                   padding: 0 {a.font_pt}px; margin: 0; }}
+        /* 녹화 버튼만 작게 — 조작 빈도가 낮고 e-stop 자리를 뺏으면 안 된다 */
+        #rec, #rec_on {{ font-size: {a.font_pt}pt; padding: 0 {round(a.font_pt * 0.7)}px; }}
+        #rec    {{ background-image: none; background-color: #444; color: #bbb; }}
+        #rec_on {{ background-image: none; background-color: #c00; color: #fff; }}
         #estop {{ background-image: none; background-color: #c00; color: #fff; }}
         #drive_off {{ background-image: none; background-color: #555; color: #ddd; }}
         #drive_on  {{ background-image: none; background-color: #1a7f37; color: #fff; }}
@@ -884,6 +995,29 @@ def main():
     # 알아서 보낸다 — 화면에서는 비상 차단과 그 해제만 다룬다.
     # 구동 허용 토글 — 기본 잠김. 이 상태를 소유하는 건 콘솔이고 joy_teleop 이 따라간다.
     # 로봇에는 모터 enable 토픽이 없다(navi 구독 8종에 없음) → IPC 측 인터록이다.
+    # 화면 녹화 토글 — 한 번 누르면 시작, 다시 누르면 중지.
+    # btns 의 맨 왼쪽에 **확장 없이** 넣는다: 오른쪽 끝의 e-stop·해제 위치가 안 변해야 한다.
+    rec = Recorder()
+    btn_rec = Gtk.Button(label=rec_label(None))
+    btn_rec.set_name("rec")
+    btn_rec.set_vexpand(True)
+
+    def rec_paint():
+        """버튼 글자·색을 현재 상태로 맞춘다. 타이머와 클릭 양쪽에서 쓴다."""
+        btn_rec.set_label(rec_label(rec.elapsed(time.monotonic())))
+        btn_rec.set_name("rec_on" if rec.on else "rec")
+        return True                      # GLib 타이머용
+
+    def on_rec_clicked(_w):
+        ok, msg = (rec.stop() if rec.on else rec.start(time.monotonic()))
+        if msg:
+            set_notice(msg, 6)
+            print(f"[녹화] {msg}", flush=True)
+        rec_paint()
+    btn_rec.connect("clicked", on_rec_clicked)
+    btns.pack_start(btn_rec, False, False, 0)
+    GLib.timeout_add_seconds(1, rec_paint)
+
     tgl = Gtk.ToggleButton(label="구동 잠김")
     tgl.set_name("drive_off")
     tgl.set_vexpand(True)
@@ -1109,9 +1243,26 @@ def main():
             return False
         GLib.timeout_add_seconds(4, dump)
     pipe.set_state(Gst.State.PLAYING)
+    # 🔴 나가기 전에 녹화를 **반드시** 멈춘다. 그냥 죽으면 GNOME 이 "Sender has vanished"
+    #    로 녹화를 접고 **재생 불가능한 조각 파일**이 남는다(시험 기록이 통째로 날아간다).
+    #    SIGTERM 도 잡아야 한다 — `systemctl --user restart navi-console`(리셋 버튼)이
+    #    그걸 보내는데, 기본 동작은 finally 를 안 거치고 죽는 것이다.
+    def _finish_rec(*_):
+        ok, msg = rec.stop()
+        if msg:
+            print(f"[녹화] {msg}", flush=True)
+        return ok
+
+    def _on_term(*_):
+        _finish_rec()
+        Gtk.main_quit()
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, _on_term)
+
     try:
         Gtk.main()
     finally:
+        _finish_rec()
         cli.publish(f"{a.prefix}/cmd/stream", '{"on":false}', qos=1)  # 프레임 발행 끄고 나간다
         time.sleep(0.2)
         pipe.set_state(Gst.State.NULL)
